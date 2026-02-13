@@ -267,6 +267,7 @@ namespace Roaba_Matii
 
                 Console.Write("\n🪣 ia, care-l vrei? (numaru ala din stanga): ");
                 int index = int.Parse(Console.ReadLine());
+                Console.Write("SA MORI TU, " + allProcesses[index]);
                 targetProcess = allProcesses[index];
 
                 Console.WriteLine($"\n[+] stai putin bag procesu in roaba: {targetProcess.ProcessName} ...");
