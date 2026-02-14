@@ -5,16 +5,16 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+
 namespace Roaba_Matii
 {
-
     class RoabaCube
     {
         private static bool spinEnabled = true;
         private static float A = 0, B = 0, C = 0;
 
-        const int width = 40;  // Smaller for corner
-        const int height = 20; // Smaller for corner
+        const int width = 40;
+        const int height = 20;
         private static float[] zBuffer = new float[width * height];
         private static char[] buffer = new char[width * height];
         const char backgroundASCIICode = ' ';
@@ -32,7 +32,6 @@ namespace Roaba_Matii
         private static Thread cubeThread = null;
         private static bool isRunning = false;
 
-        // Start cube in background thread
         public static void StartCube()
         {
             if (isRunning) return;
@@ -50,10 +49,8 @@ namespace Roaba_Matii
                         Array.Fill(buffer, backgroundASCIICode);
                         Array.Fill(zBuffer, 0f);
 
-                        // Render cube
                         RenderCube(6, 0, "ROABA", 0);
 
-                        // Draw to top right corner
                         int currentX = Console.WindowWidth - width - 2;
 
                         for (int y = 0; y < height; y++)
@@ -77,10 +74,7 @@ namespace Roaba_Matii
 
                         Thread.Sleep(50);
                     }
-                    catch
-                    {
-                        // Ignore errors if console resizes
-                    }
+                    catch { }
                 }
             });
 
@@ -96,7 +90,6 @@ namespace Roaba_Matii
                 cubeThread.Join(1000);
             }
 
-            // Clear cube area
             try
             {
                 int startX = Console.WindowWidth - width - 2;
@@ -124,7 +117,6 @@ namespace Roaba_Matii
                 }
             }
 
-            // Draw text in front
             float textZ = -cubeWidth;
             float charSpacing = 2.8f;
             float totalWidth = (text.Length - 1) * charSpacing;
@@ -209,11 +201,195 @@ namespace Roaba_Matii
         }
     }
 
+    // NEW: Axon-style Unprotect
+    class RoabaUnprotect
+    {
+        [DllImport("kernel32.dll")]
+        static extern IntPtr VirtualAlloc(IntPtr lpAddress, uint dwSize, uint flAllocationType, uint flProtect);
+
+        [DllImport("kernel32.dll")]
+        static extern bool VirtualFree(IntPtr lpAddress, uint dwSize, uint dwFreeType);
+
+        const uint MEM_COMMIT = 0x1000;
+        const uint MEM_RESERVE = 0x2000;
+        const uint MEM_RELEASE = 0x8000;
+        const uint PAGE_EXECUTE_READWRITE = 0x40;
+
+        public static IntPtr UnprotectFunction(IntPtr processHandle, IntPtr functionAddr, int maxSize = 256)
+        {
+            try
+            {
+                Console.WriteLine($"\n[+] Unprotecting function at 0x{functionAddr.ToString("X")}...");
+
+                byte[] originalBytes = new byte[maxSize];
+                RoabaX.ReadProcessMemory(processHandle, functionAddr, originalBytes, maxSize, out int bytesRead);
+
+                int funcSize = FindFunctionSize(originalBytes, maxSize);
+
+                if (funcSize == 0)
+                {
+                    Console.WriteLine("[!] Could not determine function size");
+                    return functionAddr;
+                }
+
+                Console.WriteLine($"[+] Function size: {funcSize} bytes");
+
+                IntPtr newFunc = VirtualAlloc(IntPtr.Zero, (uint)funcSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
+                if (newFunc == IntPtr.Zero)
+                {
+                    Console.WriteLine("[!] Failed to allocate memory");
+                    return functionAddr;
+                }
+
+                Console.WriteLine($"[+] Allocated at 0x{newFunc.ToString("X")}");
+
+                Marshal.Copy(originalBytes, 0, newFunc, funcSize);
+
+                int patchCount = PatchSecurityChecks(newFunc, funcSize);
+
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[+] Function unprotected! Patched {patchCount} security checks 🎉");
+                Console.ResetColor();
+
+                return newFunc;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[!] Unprotect failed: {ex.Message}");
+                return functionAddr;
+            }
+        }
+
+        static int FindFunctionSize(byte[] bytes, int maxSize)
+        {
+            for (int i = 16; i < maxSize - 2; i++)
+            {
+                // x64 epilogue patterns
+                if (bytes[i] == 0x48 && bytes[i + 1] == 0x83 && bytes[i + 2] == 0xC4 && i + 4 < maxSize && bytes[i + 4] == 0xC3)
+                    return i + 5;
+
+                if (bytes[i] == 0x5D && bytes[i + 1] == 0xC3)
+                    return i + 2;
+
+                if (bytes[i] == 0xC3 && i > 32)
+                    return i + 1;
+            }
+            return 0;
+        }
+
+        static int PatchSecurityChecks(IntPtr funcAddr, int size)
+        {
+            byte[] bytes = new byte[size];
+            Marshal.Copy(funcAddr, bytes, 0, size);
+
+            int patchCount = 0;
+
+            for (int i = 0; i < size - 7; i++)
+            {
+                // Axon pattern: jb instruction followed by security check
+                if (bytes[i] == 0x72 && i + 7 < size && bytes[i + 2] == 0xA1 && bytes[i + 7] == 0x8B)
+                {
+                    Console.WriteLine($"    [*] Found security check at offset +0x{i:X} (Axon pattern)");
+                    bytes[i] = 0xEB; // jb -> jmp
+                    patchCount++;
+                }
+
+                // INT3 breakpoints
+                if (bytes[i] == 0xCC)
+                {
+                    Console.WriteLine($"    [*] Found INT3 at offset +0x{i:X}");
+                    bytes[i] = 0x90; // NOP
+                    patchCount++;
+                }
+            }
+
+            if (patchCount > 0)
+            {
+                Marshal.Copy(bytes, 0, funcAddr, size);
+            }
+
+            return patchCount;
+        }
+    }
+
+    // NEW: Advanced Pattern Scanner
+    class RoabaAdvancedScan
+    {
+        public static IntPtr ScanWithOffset(IntPtr processHandle, Process targetProcess, string pattern, int returnOffset = 0)
+        {
+            Console.WriteLine($"\n[+] Advanced pattern scan: {pattern}");
+            Console.WriteLine($"[+] Return offset: +{returnOffset}");
+
+            IntPtr result = PatternScanBase(processHandle, targetProcess, pattern);
+
+            if (result != IntPtr.Zero && returnOffset != 0)
+            {
+                byte[] offsetBytes = new byte[4];
+                RoabaX.ReadProcessMemory(processHandle, result + returnOffset, offsetBytes, 4, out _);
+
+                int relativeOffset = BitConverter.ToInt32(offsetBytes, 0);
+                IntPtr absoluteAddr = result + returnOffset + 4 + relativeOffset;
+
+                Console.WriteLine($"[+] Pattern found at: 0x{result.ToString("X")}");
+                Console.WriteLine($"[+] Relative offset: 0x{relativeOffset:X}");
+                Console.WriteLine($"[+] Absolute address: 0x{absoluteAddr.ToString("X")}");
+
+                return absoluteAddr;
+            }
+
+            return result;
+        }
+
+        static IntPtr PatternScanBase(IntPtr processHandle, Process targetProcess, string pattern)
+        {
+            string[] patternParts = pattern.Split(' ');
+            byte?[] patternBytes = new byte?[patternParts.Length];
+
+            for (int i = 0; i < patternParts.Length; i++)
+            {
+                if (patternParts[i] == "??" || patternParts[i] == "?")
+                    patternBytes[i] = null;
+                else
+                    patternBytes[i] = Convert.ToByte(patternParts[i], 16);
+            }
+
+            IntPtr baseAddr = targetProcess.MainModule.BaseAddress;
+            int moduleSize = targetProcess.MainModule.ModuleMemorySize;
+
+            int chunkSize = 4096;
+            byte[] buffer = new byte[chunkSize];
+
+            for (long offset = 0; offset < moduleSize; offset += chunkSize - patternBytes.Length)
+            {
+                IntPtr currentAddress = baseAddr + (int)offset;
+                RoabaX.ReadProcessMemory(processHandle, currentAddress, buffer, chunkSize, out int bytesRead);
+
+                for (int i = 0; i < bytesRead - patternBytes.Length; i++)
+                {
+                    bool match = true;
+                    for (int j = 0; j < patternBytes.Length; j++)
+                    {
+                        if (patternBytes[j].HasValue && buffer[i + j] != patternBytes[j].Value)
+                        {
+                            match = false;
+                            break;
+                        }
+                    }
+
+                    if (match)
+                    {
+                        return currentAddress + i;
+                    }
+                }
+            }
+
+            return IntPtr.Zero;
+        }
+    }
 
     class RoabaX
     {
-
-
         [DllImport("kernel32.dll")]
         static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
 
@@ -227,7 +403,7 @@ namespace Roaba_Matii
         );
 
         [DllImport("kernel32.dll")]
-        static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int dwSize, out int lpNumberOfBytesRead);
+        public static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int dwSize, out int lpNumberOfBytesRead);
 
         [DllImport("kernel32.dll")]
         static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int dwSize, out int lpNumberOfBytesWritten);
@@ -242,8 +418,8 @@ namespace Roaba_Matii
         const uint PAGE_EXECUTE_READWRITE = 0x40;
         const uint PAGE_READWRITE = 0x04;
 
-        static IntPtr processHandle = IntPtr.Zero;
-        static Process targetProcess = null;
+        public static IntPtr processHandle = IntPtr.Zero;
+        public static Process targetProcess = null;
 
         static void Main()
         {
@@ -251,7 +427,6 @@ namespace Roaba_Matii
 
             try
             {
-                // Select process
                 Process[] allProcesses = Process.GetProcesses();
                 Console.WriteLine("🛞 Vezi care vrei sal strici de acilea (procese):\n");
 
@@ -267,13 +442,11 @@ namespace Roaba_Matii
 
                 Console.Write("\n🪣 ia, care-l vrei? (numaru ala din stanga): ");
                 int index = int.Parse(Console.ReadLine());
-                Console.Write("SA MORI TU, " + allProcesses[index]);
                 targetProcess = allProcesses[index];
 
                 Console.WriteLine($"\n[+] stai putin bag procesu in roaba: {targetProcess.ProcessName} ...");
                 Thread.Sleep(500);
 
-                // Open with read AND write permissions
                 processHandle = OpenProcess(
                     PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION,
                     false,
@@ -289,7 +462,6 @@ namespace Roaba_Matii
                 Console.WriteLine($"[+] ok bn am bagat prostia in roaba (vezi sa nu iti scape roaba) Handel: 0x{processHandle.ToString("X")}");
                 Console.WriteLine($"[+] Base address: 0x{targetProcess.MainModule.BaseAddress.ToString("X")}");
 
-                // Main menu loop
                 bool running = true;
                 while (running)
                 {
@@ -300,7 +472,8 @@ namespace Roaba_Matii
                     Console.WriteLine("[2] ✏️  Scrie memorie");
                     Console.WriteLine("[3] 🔍 Skaneaza ca aia din star trek pt o valoare");
                     Console.WriteLine("[4] 🎯 Pattern scan (AOB ca profesionistii)");
-                    Console.WriteLine("[5] 🚪 Parkeaza roaba");
+                    Console.WriteLine("[5] ⚡ ROABA TURBO");
+                    Console.WriteLine("[6] 🚪 Parkeaza roaba");
                     Console.Write("\n🔧 Choice: ");
 
                     string choice = Console.ReadLine();
@@ -320,6 +493,9 @@ namespace Roaba_Matii
                             PatternScan();
                             break;
                         case "5":
+                            AdvancedMode();
+                            break;
+                        case "6":
                             running = false;
                             break;
                         default:
@@ -347,6 +523,197 @@ namespace Roaba_Matii
 
             Console.WriteLine("\n🛞 press any key sa nu iti ia tigani roaba...");
             Console.ReadKey();
+        }
+
+        // NEW: Advanced Mode Menu
+        static void AdvancedMode()
+        {
+            Console.WriteLine("\n╔═══════════════════════════════════════╗");
+            Console.WriteLine("║      ⚡ ROABA TURBAT MODE ⚡          ║");
+            Console.WriteLine("║   (Tehnici de la Axon si Synapse)     ║");
+            Console.WriteLine("╚═══════════════════════════════════════╝");
+
+            Console.WriteLine("\n[1] 🔓 Unprotect Function (Axon style)");
+            Console.WriteLine("[2] 🎯 Advanced pattern scan cu offset");
+            Console.WriteLine("[3] 📊 Memory region info");
+            Console.WriteLine("[4] 🔍 Multi-scan pattern");
+            Console.Write("\nAlege: ");
+
+            string choice = Console.ReadLine();
+
+            switch (choice)
+            {
+                case "1":
+                    UnprotectFunctionMenu();
+                    break;
+                case "2":
+                    AdvancedPatternMenu();
+                    break;
+                case "3":
+                    MemoryRegionInfo();
+                    break;
+                case "4":
+                    MultiScanPattern();
+                    break;
+            }
+        }
+
+        static void UnprotectFunctionMenu()
+        {
+            try
+            {
+                Console.Write("\n📍 Function address (hex): ");
+                IntPtr addr = (IntPtr)Convert.ToInt64(Console.ReadLine(), 16);
+
+                IntPtr unprotected = RoabaUnprotect.UnprotectFunction(processHandle, addr);
+
+                if (unprotected != addr)
+                {
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine($"\n[+] Unprotected copy la: 0x{unprotected.ToString("X")}");
+                    Console.WriteLine("[+] Acum poti chema functia fara probleme!");
+                    Console.ResetColor();
+                }
+            }
+            catch (Exception ex)
+            {
+                AxleSqueaking($"Unprotect failed: {ex.Message}");
+            }
+        }
+
+        static void AdvancedPatternMenu()
+        {
+            try
+            {
+                Console.WriteLine("\n🎯 Advanced Pattern Scan (Axon Style)");
+                Console.WriteLine("Example: 48 8B 0D ?? ?? ?? ?? (mov rcx, [rip+offset])");
+
+                Console.Write("\nPattern: ");
+                string pattern = Console.ReadLine();
+
+                Console.Write("Return offset (pt RIP-relative, de obicei 3): ");
+                string offsetInput = Console.ReadLine();
+                int offset = string.IsNullOrEmpty(offsetInput) ? 0 : int.Parse(offsetInput);
+
+                IntPtr result = RoabaAdvancedScan.ScanWithOffset(processHandle, targetProcess, pattern, offset);
+
+                if (result != IntPtr.Zero)
+                {
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine($"\n[+] Gasit! Address: 0x{result.ToString("X")}");
+                    Console.ResetColor();
+
+                    Console.WriteLine("\n[+] Bytes din jur:");
+                    byte[] context = new byte[32];
+                    ReadProcessMemory(processHandle, result, context, 32, out _);
+
+                    for (int i = 0; i < 32; i++)
+                    {
+                        if (i % 16 == 0) Console.Write($"\n0x{(result.ToInt64() + i):X8}:  ");
+                        Console.Write($"{context[i]:X2} ");
+                    }
+                    Console.WriteLine("\n");
+                }
+                else
+                {
+                    Console.WriteLine("[-] Pattern nu a fost gasit");
+                }
+            }
+            catch (Exception ex)
+            {
+                AxleSqueaking($"Scan failed: {ex.Message}");
+            }
+        }
+
+        static void MemoryRegionInfo()
+        {
+            Console.WriteLine("\n📊 Memory Region Scanner");
+            Console.WriteLine("[+] Analyzing process memory...\n");
+
+            Console.WriteLine("Region          Start Address         Size        Protection");
+            Console.WriteLine("────────────────────────────────────────────────────────────");
+
+            IntPtr baseAddr = targetProcess.MainModule.BaseAddress;
+            int moduleSize = targetProcess.MainModule.ModuleMemorySize;
+
+            Console.WriteLine($"Main Module     0x{baseAddr.ToString("X").PadRight(20)} {(moduleSize / 1024).ToString().PadRight(12)} KB    RWX");
+
+            Console.WriteLine($"\n[+] Module: {targetProcess.MainModule.ModuleName}");
+            Console.WriteLine($"[+] Base: 0x{baseAddr.ToString("X")}");
+            Console.WriteLine($"[+] Size: {moduleSize / 1024 / 1024} MB");
+            Console.WriteLine($"[+] Entry Point: 0x{targetProcess.MainModule.EntryPointAddress.ToString("X")}");
+        }
+
+        static void MultiScanPattern()
+        {
+            try
+            {
+                Console.Write("\nPattern (hex cu wildcards): ");
+                string pattern = Console.ReadLine();
+
+                Console.Write("Max results (default 10): ");
+                string maxInput = Console.ReadLine();
+                int maxResults = string.IsNullOrEmpty(maxInput) ? 10 : int.Parse(maxInput);
+
+                Console.WriteLine($"\n[+] Scanam pentru pattern: {pattern}");
+                Console.WriteLine($"[+] Max {maxResults} rezultate\n");
+
+                string[] patternParts = pattern.Split(' ');
+                byte?[] patternBytes = new byte?[patternParts.Length];
+
+                for (int i = 0; i < patternParts.Length; i++)
+                {
+                    if (patternParts[i] == "??" || patternParts[i] == "?")
+                        patternBytes[i] = null;
+                    else
+                        patternBytes[i] = Convert.ToByte(patternParts[i], 16);
+                }
+
+                List<IntPtr> results = new List<IntPtr>();
+                IntPtr baseAddr = targetProcess.MainModule.BaseAddress;
+                int moduleSize = targetProcess.MainModule.ModuleMemorySize;
+
+                int chunkSize = 4096;
+                byte[] buffer = new byte[chunkSize];
+
+                for (long offset = 0; offset < moduleSize && results.Count < maxResults; offset += chunkSize - patternBytes.Length)
+                {
+                    IntPtr currentAddress = baseAddr + (int)offset;
+                    ReadProcessMemory(processHandle, currentAddress, buffer, chunkSize, out int bytesRead);
+
+                    for (int i = 0; i < bytesRead - patternBytes.Length; i++)
+                    {
+                        bool match = true;
+                        for (int j = 0; j < patternBytes.Length; j++)
+                        {
+                            if (patternBytes[j].HasValue && buffer[i + j] != patternBytes[j].Value)
+                            {
+                                match = false;
+                                break;
+                            }
+                        }
+
+                        if (match)
+                        {
+                            results.Add(currentAddress + i);
+                            if (results.Count >= maxResults) break;
+                        }
+                    }
+                }
+
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[+] Gasit {results.Count} rezultate!\n");
+                Console.ResetColor();
+
+                for (int i = 0; i < results.Count; i++)
+                {
+                    Console.WriteLine($"  [{i}] 0x{results[i].ToString("X")}");
+                }
+            }
+            catch (Exception ex)
+            {
+                AxleSqueaking($"Multi-scan failed: {ex.Message}");
+            }
         }
 
         static void ReadMemory()
@@ -425,7 +792,6 @@ namespace Roaba_Matii
 
                         if (string.IsNullOrEmpty(hexInput))
                         {
-                            // Load Roaba.dll from disk
                             string dllPath = "Roaba.dll";
 
                             if (!System.IO.File.Exists(dllPath))
@@ -463,10 +829,8 @@ namespace Roaba_Matii
                 Console.WriteLine($"[+] Bagam roaba la 0x{address.ToString("X")}...");
                 Thread.Sleep(200);
 
-                // LOCAL variable for old protect
                 uint oldProtect;
 
-                // Change protection to writable
                 bool protectChanged = VirtualProtectEx(
                     processHandle,
                     address,
@@ -480,10 +844,8 @@ namespace Roaba_Matii
                     AxleSqueaking("Nu pot sa schimb protectia memoriei");
                 }
 
-                // Write the data
                 bool success = WriteProcessMemory(processHandle, address, dataToWrite, dataToWrite.Length, out int bytesWritten);
 
-                // Restore original protection
                 if (protectChanged)
                 {
                     uint temp;
@@ -506,7 +868,6 @@ namespace Roaba_Matii
                 Console.WriteLine($"[+] IeI a mers roaba {bytesWritten} bytes! 🎉");
                 Console.ResetColor();
 
-                // Read back to verify
                 Console.WriteLine("\n[+] Verificam daca a mers roaba corect...");
                 byte[] verifyBuffer = new byte[dataToWrite.Length];
                 ReadProcessMemory(processHandle, address, verifyBuffer, verifyBuffer.Length, out int verifyRead);
@@ -563,7 +924,6 @@ namespace Roaba_Matii
                         }
                     }
 
-                    // Progress indicator
                     if (offset % (moduleSize / 20) == 0)
                     {
                         Console.Write("█");
@@ -611,7 +971,6 @@ namespace Roaba_Matii
                     return;
                 }
 
-                // Parse pattern
                 string[] patternParts = patternInput.Split(' ');
                 byte?[] pattern = new byte?[patternParts.Length];
 
@@ -619,7 +978,7 @@ namespace Roaba_Matii
                 {
                     if (patternParts[i] == "??" || patternParts[i] == "?")
                     {
-                        pattern[i] = null; // Wildcard
+                        pattern[i] = null;
                     }
                     else
                     {
@@ -649,7 +1008,6 @@ namespace Roaba_Matii
                     IntPtr currentAddress = baseAddr + (int)offset;
                     ReadProcessMemory(processHandle, currentAddress, buffer, chunkSize, out int bytesRead);
 
-                    // Scan this chunk for pattern
                     for (int i = 0; i < bytesRead - pattern.Length; i++)
                     {
                         bool match = true;
@@ -672,7 +1030,6 @@ namespace Roaba_Matii
                     scannedBytes += bytesRead;
                     int progress = (int)((scannedBytes / (float)moduleSize) * 100);
 
-                    // Update progress every 5%
                     if (progress >= lastProgress + 5)
                     {
                         Console.Write($"[{progress}%] ");
@@ -694,7 +1051,6 @@ namespace Roaba_Matii
                         IntPtr addr = results[i];
                         Console.WriteLine($"\n  [{i}] 0x{addr.ToString("X")}");
 
-                        // Show bytes at this location
                         byte[] foundBytes = new byte[pattern.Length];
                         ReadProcessMemory(processHandle, addr, foundBytes, pattern.Length, out _);
 
@@ -722,7 +1078,6 @@ namespace Roaba_Matii
                         Console.WriteLine($"\n  ... si inca {results.Count - 10} rezultate");
                     }
 
-                    // Option to read/write at found address
                     Console.Write("\n\n📝 Vrei sa citesti/scrii la vreuna? (numarul sau ENTER): ");
                     string choice = Console.ReadLine();
 
@@ -805,13 +1160,11 @@ namespace Roaba_Matii
             {
                 Console.Write($"0x{(startAddress.ToInt64() + i):X8}  ");
 
-                // Hex values
                 for (int j = 0; j < 16 && i + j < bytesRead; j++)
                 {
                     Console.Write($"{buffer[i + j]:X2} ");
                 }
 
-                // Padding
                 for (int j = bytesRead - i; j < 16; j++)
                 {
                     Console.Write("   ");
@@ -819,7 +1172,6 @@ namespace Roaba_Matii
 
                 Console.Write("  ");
 
-                // ASCII
                 for (int j = 0; j < 16 && i + j < bytesRead; j++)
                 {
                     char c = (char)buffer[i + j];
@@ -833,20 +1185,21 @@ namespace Roaba_Matii
         static void ShowSplashScreen()
         {
             Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.ForegroundColor = ConsoleColor.Yellow;
             Console.WriteLine("╔═════════════════════════════════════════╗");
             Console.WriteLine("║                                         ║");
             Console.WriteLine("║            🛞 ROABA X 🛞                ║");
             Console.WriteLine("║         (garantat tigan proof)          ║");
             Console.WriteLine("║      \"o roata, hackuri infinite\"        ║");
-            Console.WriteLine("║              LOVE HIRO  ❤️              ║");
+            Console.WriteLine("║              LOVE HIRO                  ║");
             Console.WriteLine("║    Powered by magie si o roata proasta  ║");
             Console.WriteLine("║(si un ax prost ca sa fie treaba treaba) ║");
-            Console.WriteLine("║                                         ║");
-            Console.WriteLine("║       versuiunea: 1.Roaba-RW            ║");
+            Console.WriteLine("║            BAGA VITEZA BOS              ║");
+            Console.WriteLine("║     versuiunea: 1.Roaba Pe Benzina      ║");
             Console.WriteLine("║         florin salam on top             ║");
             Console.WriteLine("╚═════════════════════════════════════════╝");
             Console.ResetColor();
-            //RoabaCube.StartCube();
+            Console.ResetColor();
             Console.WriteLine();
 
             Console.Write("[+] Loading wheel... ");
@@ -864,6 +1217,11 @@ namespace Roaba_Matii
             Console.ResetColor();
 
             Console.WriteLine("[+] Bagam ulei de motor la roti... ✅");
+            Thread.Sleep(300);
+
+            Console.ForegroundColor = ConsoleColor.Magenta;
+            Console.WriteLine("[+] Axon power mode ACTIVATED ⚡");
+            Console.ResetColor();
             Thread.Sleep(300);
 
             Console.WriteLine("[+] Ok gata 🪣\n");
