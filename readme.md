@@ -9,6 +9,7 @@ A Romanian-themed memory editor and process manipulation tool written in C#.
 -  Memory writing  
 -  Value scanning
 -  Pattern scanning (AOB with wildcards)
+-  Advanced mode with function unprotect etc
 -  Bonus: Spinning ASCII cube
 
 ## What is a Roaba?
@@ -28,6 +29,7 @@ Select a process, then choose from:
 - Read memory at address
 - Write memory (integers, floats, bytes, or inject DLL)
 - Scan for specific value
+- ROABA TURBO
 - Pattern scan with wildcards (e.g., `48 8B 05 ?? ?? ?? ??`)
 
 ## Credits
@@ -36,7 +38,7 @@ Select a process, then choose from:
 - garantat tigan proof ❌
 
 ## Disclaimer
-For educational purposes only. But you may use Roaba X however you like as it is not that powerful and not configured to bypass anticheat
+For educational purposes only. But you may use Roaba X however you like as it is not that powerful and not configured to bypass anticheat ( yet :) )
 
 ## License
 MIT or whatever, just don't let the gypsies steal the roaba 🛞
