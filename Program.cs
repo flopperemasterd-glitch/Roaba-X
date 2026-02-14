@@ -1,10 +1,301 @@
+using Roaba_Matii;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
+using System.IO.Pipes;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+
+class RoabaPipe
+{
+    private static Thread pipeThread = null;
+    private static bool isRunning = false;
+    private static NamedPipeServerStream pipeServer = null;
+    public volatile static bool pipeBusy = false;
+    public static void StartPipeServer()
+    {
+        if (isRunning) return;
+
+        isRunning = true;
+        pipeThread = new Thread(() =>
+        {
+            while (isRunning)
+            {
+                try
+                {
+                    Console.ForegroundColor = ConsoleColor.Cyan;
+                    //Console.WriteLine("\n[+] Tevi server started: \\\\.\\pipe\\RoabaX");
+                    // Console.WriteLine("[+] Asteptand comenzi...");
+                    
+                    Console.ResetColor();
+
+                    pipeServer = new NamedPipeServerStream(
+                        "RoabaX",
+                        PipeDirection.InOut,
+                        1,
+                        PipeTransmissionMode.Byte,
+                        PipeOptions.Asynchronous
+                    );
+                    pipeServer.WaitForConnection();
+
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    //Console.WriteLine("[+] Sa konektat clientu");
+                    Console.ResetColor();
+
+                    StreamReader reader = new StreamReader(pipeServer);
+                    string command = reader.ReadToEnd();
+
+                    if (!string.IsNullOrEmpty(command))
+                    {
+                        //Console.WriteLine($"\n[BURLAN] Am primit: {command.Substring(0, Math.Min(50, command.Length))}...");
+                        ExecutePipeCommand(command);
+                    }
+
+                    pipeServer.Close();
+                }
+                catch (Exception ex)
+                {
+                    //Console.WriteLine($"[!] Burlan error: {ex.Message}");
+                }
+            }
+        });
+
+        pipeThread.IsBackground = true;
+        pipeThread.Start();
+        pipeBusy = true;
+    }
+
+    public static void StopPipeServer()
+    {
+        isRunning = false;
+        pipeBusy = false;
+        if (pipeServer != null)
+        {
+            try
+            {
+                pipeServer.Close();
+            }
+            catch { }
+        }
+        Console.WriteLine("[+] Tevi server oprit");
+    }
+
+    static void ExecutePipeCommand(string command)
+    {
+        try
+        {
+            // Parse command format: "COMMAND:DATA"
+            string[] parts = command.Split(new[] { ':' }, 2);
+            string cmd = parts[0].ToUpper();
+            string data = parts.Length > 1 ? parts[1] : "";
+
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"[PIPE] Executing: {cmd}");
+            Console.ResetColor();
+
+            switch (cmd)
+            {
+                case "READ":
+                    PipeReadMemory(data);
+                    break;
+
+                case "WRITE":
+                    PipeWriteMemory(data);
+                    break;
+
+                case "SCAN":
+                    PipeScanValue(data);
+                    break;
+
+                case "PATTERN":
+                    PipePatternScan(data);
+                    break;
+
+                case "INFO":
+                    PipeProcessInfo();
+                    break;
+
+                default:
+                    Console.WriteLine($"[!] Comanda proasta: {cmd}");
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[!] Baga baterii la telecomanda: {ex.Message}");
+        }
+    }
+
+    static void PipeReadMemory(string data)
+    {
+        // Format: "ADDRESS,SIZE"
+        string[] parts = data.Split(',');
+        if (parts.Length != 2) return;
+
+        IntPtr address = (IntPtr)Convert.ToInt64(parts[0], 16);
+        int size = int.Parse(parts[1]);
+
+        byte[] buffer = new byte[size];
+        RoabaX.ReadProcessMemory(RoabaX.processHandle, address, buffer, size, out int bytesRead);
+
+        Console.WriteLine($"[PIPE] Read {bytesRead} bytes from 0x{address.ToString("X")}");
+        Console.Write("Data: ");
+        for (int i = 0; i < Math.Min(bytesRead, 32); i++)
+        {
+            Console.Write($"{buffer[i]:X2} ");
+        }
+        Console.WriteLine();
+    }
+
+    static void PipeWriteMemory(string data)
+    {
+        // Format: "ADDRESS,TYPE,VALUE"
+        // Example: "7FF612340000,INT,1337"
+        string[] parts = data.Split(',');
+        if (parts.Length != 3) return;
+
+        IntPtr address = (IntPtr)Convert.ToInt64(parts[0], 16);
+        string type = parts[1].ToUpper();
+        string value = parts[2];
+
+        byte[] dataToWrite = null;
+
+        switch (type)
+        {
+            case "INT":
+                dataToWrite = BitConverter.GetBytes(int.Parse(value));
+                break;
+            case "FLOAT":
+                dataToWrite = BitConverter.GetBytes(float.Parse(value));
+                break;
+            case "BYTES":
+                string[] hexBytes = value.Split(' ');
+                dataToWrite = new byte[hexBytes.Length];
+                for (int i = 0; i < hexBytes.Length; i++)
+                {
+                    dataToWrite[i] = Convert.ToByte(hexBytes[i], 16);
+                }
+                break;
+        }
+
+        if (dataToWrite != null)
+        {
+            uint oldProtect;
+            RoabaX.VirtualProtectEx(RoabaX.processHandle, address, (UIntPtr)dataToWrite.Length, 0x40, out oldProtect);
+            RoabaX.WriteProcessMemory(RoabaX.processHandle, address, dataToWrite, dataToWrite.Length, out int written);
+            RoabaX.VirtualProtectEx(RoabaX.processHandle, address, (UIntPtr)dataToWrite.Length, oldProtect, out _);
+
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"[PIPE] Wrote {written} bytes to 0x{address.ToString("X")}");
+            Console.ResetColor();
+        }
+    }
+
+    static void PipeScanValue(string data)
+    {
+        // Format: "VALUE"
+        int valueToFind = int.Parse(data);
+        Console.WriteLine($"[PIPE] Scanning for value: {valueToFind}");
+
+        // Simple scan (first 10 results)
+        List<IntPtr> results = new List<IntPtr>();
+        byte[] valueBytes = BitConverter.GetBytes(valueToFind);
+
+        IntPtr baseAddr = RoabaX.targetProcess.MainModule.BaseAddress;
+        int moduleSize = RoabaX.targetProcess.MainModule.ModuleMemorySize;
+
+        int chunkSize = 4096;
+        byte[] buffer = new byte[chunkSize];
+
+        for (long offset = 0; offset < moduleSize && results.Count < 10; offset += chunkSize - 3)
+        {
+            IntPtr currentAddress = baseAddr + (int)offset;
+            RoabaX.ReadProcessMemory(RoabaX.processHandle, currentAddress, buffer, chunkSize, out int bytesRead);
+
+            for (int i = 0; i < bytesRead - 3; i++)
+            {
+                if (buffer[i] == valueBytes[0] &&
+                    buffer[i + 1] == valueBytes[1] &&
+                    buffer[i + 2] == valueBytes[2] &&
+                    buffer[i + 3] == valueBytes[3])
+                {
+                    results.Add(currentAddress + i);
+                    if (results.Count >= 10) break;
+                }
+            }
+        }
+
+        Console.WriteLine($"[PIPE] Found {results.Count} results:");
+        foreach (var addr in results)
+        {
+            Console.WriteLine($"  0x{addr.ToString("X")}");
+        }
+    }
+
+    static void PipePatternScan(string data)
+    {
+        // Format: "48 8B 05 ?? ?? ?? ??"
+        Console.WriteLine($"[PIPE] Pattern scanning: {data}");
+
+        string[] patternParts = data.Split(' ');
+        byte?[] pattern = new byte?[patternParts.Length];
+
+        for (int i = 0; i < patternParts.Length; i++)
+        {
+            if (patternParts[i] == "??" || patternParts[i] == "?")
+                pattern[i] = null;
+            else
+                pattern[i] = Convert.ToByte(patternParts[i], 16);
+        }
+
+        IntPtr baseAddr = RoabaX.targetProcess.MainModule.BaseAddress;
+        int moduleSize = RoabaX.targetProcess.MainModule.ModuleMemorySize;
+        int chunkSize = 4096;
+        byte[] buffer = new byte[chunkSize];
+
+        for (long offset = 0; offset < moduleSize; offset += chunkSize - pattern.Length)
+        {
+            IntPtr currentAddress = baseAddr + (int)offset;
+            RoabaX.ReadProcessMemory(RoabaX.processHandle, currentAddress, buffer, chunkSize, out int bytesRead);
+
+            for (int i = 0; i < bytesRead - pattern.Length; i++)
+            {
+                bool match = true;
+                for (int j = 0; j < pattern.Length; j++)
+                {
+                    if (pattern[j].HasValue && buffer[i + j] != pattern[j].Value)
+                    {
+                        match = false;
+                        break;
+                    }
+                }
+
+                if (match)
+                {
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine($"[PIPE] Pattern found at: 0x{(currentAddress + i).ToString("X")}");
+                    Console.ResetColor();
+                    return;
+                }
+            }
+        }
+
+        Console.WriteLine("[PIPE] Pattern not found");
+    }
+
+    static void PipeProcessInfo()
+    {
+        Console.WriteLine($"[PIPE] Process Info:");
+        Console.WriteLine($"  Name: {RoabaX.targetProcess.ProcessName}");
+        Console.WriteLine($"  PID: {RoabaX.targetProcess.Id}");
+        Console.WriteLine($"  Base: 0x{RoabaX.targetProcess.MainModule.BaseAddress.ToString("X")}");
+        Console.WriteLine($"  Size: {RoabaX.targetProcess.MainModule.ModuleMemorySize / 1024 / 1024} MB");
+    }
+}
+
 
 namespace Roaba_Matii
 {
@@ -201,7 +492,6 @@ namespace Roaba_Matii
         }
     }
 
-    // NEW: Axon-style Unprotect
     class RoabaUnprotect
     {
         [DllImport("kernel32.dll")]
@@ -390,11 +680,12 @@ namespace Roaba_Matii
 
     class RoabaX
     {
+        public static readonly object ConsoleLock = new object();
         [DllImport("kernel32.dll")]
         static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
 
         [DllImport("kernel32.dll", SetLastError = true)]
-        static extern bool VirtualProtectEx(
+        public static extern bool VirtualProtectEx(
             IntPtr hProcess,
             IntPtr lpAddress,
             UIntPtr dwSize,
@@ -406,7 +697,7 @@ namespace Roaba_Matii
         public static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int dwSize, out int lpNumberOfBytesRead);
 
         [DllImport("kernel32.dll")]
-        static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int dwSize, out int lpNumberOfBytesWritten);
+        public static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int dwSize, out int lpNumberOfBytesWritten);
 
         [DllImport("kernel32.dll")]
         static extern bool CloseHandle(IntPtr hObject);
@@ -473,7 +764,8 @@ namespace Roaba_Matii
                     Console.WriteLine("[3] 🔍 Skaneaza ca aia din star trek pt o valoare");
                     Console.WriteLine("[4] 🎯 Pattern scan (AOB ca profesionistii)");
                     Console.WriteLine("[5] ⚡ ROABA TURBO");
-                    Console.WriteLine("[6] 🚪 Parkeaza roaba");
+                    Console.WriteLine("[6] ?? Tevi server (Executie cu telecomanda)");
+                    Console.WriteLine("[7] 🚪 Parkeaza roaba");
                     Console.Write("\n🔧 Choice: ");
 
                     string choice = Console.ReadLine();
@@ -496,10 +788,13 @@ namespace Roaba_Matii
                             AdvancedMode();
                             break;
                         case "6":
+                            BurlanServerMenu();
+                            break;
+                        case "7":
                             running = false;
                             break;
                         default:
-                            AxleSqueaking("Ai bagat adresa de memorie in loc de optiune?");
+                            AxleSqueaking("Ai bagat adresa de memorie/bytesi in loc de optiune?");
                             break;
                     }
                 }
@@ -533,10 +828,10 @@ namespace Roaba_Matii
             Console.WriteLine("║   (Tehnici de la Axon si Synapse)     ║");
             Console.WriteLine("╚═══════════════════════════════════════╝");
 
-            Console.WriteLine("\n[1] 🔓 Unprotect Function (Axon style)");
-            Console.WriteLine("[2] 🎯 Advanced pattern scan cu offset");
-            Console.WriteLine("[3] 📊 Memory region info");
-            Console.WriteLine("[4] 🔍 Multi-scan pattern");
+            Console.WriteLine("\n[1]  Unprotect Function");
+            Console.WriteLine("[2]  Advanced pattern scan cu offset");
+            Console.WriteLine("[3]  Memory region info");
+            Console.WriteLine("[4]  Multi-scan pattern");
             Console.Write("\nAlege: ");
 
             string choice = Console.ReadLine();
@@ -585,7 +880,7 @@ namespace Roaba_Matii
         {
             try
             {
-                Console.WriteLine("\n🎯 Advanced Pattern Scan (Axon Style)");
+                Console.WriteLine("\n🎯 Advanced Pattern Scan");
                 Console.WriteLine("Example: 48 8B 0D ?? ?? ?? ?? (mov rcx, [rip+offset])");
 
                 Console.Write("\nPattern: ");
@@ -1220,7 +1515,7 @@ namespace Roaba_Matii
             Thread.Sleep(300);
 
             Console.ForegroundColor = ConsoleColor.Magenta;
-            Console.WriteLine("[+] Axon power mode ACTIVATED ⚡");
+            Console.WriteLine("[+] ROABA TURBO MOD ACTIVAT ⚡");
             Console.ResetColor();
             Thread.Sleep(300);
 
@@ -1258,6 +1553,59 @@ namespace Roaba_Matii
             Console.WriteLine("\n[X] A CAZUT ROABA NUuUuUuU");
             Console.WriteLine($"    (combo fatal, eroare: {error})");
             Console.ResetColor();
+        }
+
+        static void BurlanServerMenu()
+        {
+            Console.WriteLine("\n╔═════════════════════════════════════════╗");
+            Console.WriteLine("║    🚰 ROABA BURLAN SERVER 🚰           ║");
+            Console.WriteLine("║   (Controleaza roaba cu telecomanda )   ║");
+            Console.WriteLine("╚═════════════════════════════════════════╝");
+
+            Console.WriteLine("\n[1] ?? Start burlan server");
+            Console.WriteLine("[2] ?? Stop burlan server");
+            Console.WriteLine("[3] ?? Exemple de comenzi");
+            Console.Write("\nAlege: ");
+
+            string choice = Console.ReadLine();
+
+            switch (choice)
+            {
+                case "1":
+                    RoabaPipe.StartPipeServer();
+                    break;
+                case "2":
+                    RoabaPipe.StopPipeServer();
+                    break;
+                case "3":
+                    ShowBurlanExamples();
+                    break;
+            }
+        }
+
+        static void ShowBurlanExamples()
+        {
+            Console.WriteLine("\n📖 Burlan Command Examples:\n");
+            Console.WriteLine("READ:7FF612340000,64");
+            Console.WriteLine("  → Citeste 64 bytes de la adresa\n");
+
+            Console.WriteLine("WRITE:7FF612340000,INT,1337");
+            Console.WriteLine("  → Scrie integer 1337 la adresa\n");
+
+            Console.WriteLine("WRITE:7FF612340000,FLOAT,99.5");
+            Console.WriteLine("  → Scrie float la adresa\n");
+
+            Console.WriteLine("WRITE:7FF612340000,BYTES,90 90 90");
+            Console.WriteLine("  → Scrie bytes (NOPs) la adresa\n");
+
+            Console.WriteLine("SCAN:100");
+            Console.WriteLine("  → Scaneza pentru valoarea 100\n");
+
+            Console.WriteLine("PATTERN:48 8B 05 ?? ?? ?? ??");
+            Console.WriteLine("  → Pattern scan\n");
+
+            Console.WriteLine("INFO");
+            Console.WriteLine("  → Info despre proces\n");
         }
     }
 }
