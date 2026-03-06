@@ -2,262 +2,302 @@
 #include <windows.h>
 #include <iostream>
 #include <vector>
-#include <sstream>
+#include <map>
+#include <string>
+#include <iomanip>
+
+extern "C" {
+#include "lua.h"
+#include "lualib.h"
+#include "lauxlib.h"
+}
 
 using namespace std;
 
-// Function prototypes
-DWORD WINAPI RoabaMain(LPVOID lpParam);
-void ReadMemoryExample();
-void WriteMemoryExample();
-void ScanMemoryExample();
-void ShowMenu();
+//═══════════════════════════════════════════════════════
+// CONFIG
+//═══════════════════════════════════════════════════════
+#define ROABA_VERSION   "4.2-ENV-REAL"
+#define ROABA_IDENTITY  8
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
-    if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(hModule);
-        CreateThread(NULL, 0, RoabaMain, hModule, 0, NULL);
-    }
-    return TRUE;
+//═══════════════════════════════════════════════════════
+// GLOBAL STATE
+//═══════════════════════════════════════════════════════
+struct RoabaState {
+    lua_State* mainState = nullptr;     // "real" Roblox-like env (renv)
+    lua_State* exploitEnv = nullptr;     // exploit globals (genv) - actually a table reference
+    int identity = ROABA_IDENTITY;
+    bool detected = false;
+};
+
+RoabaState* g_RoabaState = nullptr;
+
+//═══════════════════════════════════════════════════════
+// ENVIRONMENT METAMETHOD (for genv fallback)
+//═══════════════════════════════════════════════════════
+static int genv_index(lua_State* L) {
+    // genv[key] → first look in exploit table, then fallback to renv (_G)
+    lua_getfield(L, lua_upvalueindex(1), lua_tostring(L, 2));   // check exploit table
+    if (!lua_isnil(L, -1)) return 1;
+
+    lua_pop(L, 1);
+    lua_pushvalue(L, lua_upvalueindex(2));                      // push renv
+    lua_pushvalue(L, 2);
+    lua_gettable(L, -2);
+    return 1;
 }
 
+//═══════════════════════════════════════════════════════
+// REAL ENVIRONMENT FUNCTIONS
+//═══════════════════════════════════════════════════════
+
+static int RoabaAPI_getgenv(lua_State* L) {
+    if (!g_RoabaState || !g_RoabaState->exploitEnv) {
+        lua_newtable(L);
+        return 1;
+    }
+
+    // Return the exploit globals table
+    lua_pushlightuserdata(L, g_RoabaState->exploitEnv); // we store table as lightuserdata ref
+    lua_gettable(L, LUA_REGISTRYINDEX);                 // retrieve from registry
+    return 1;
+}
+
+static int RoabaAPI_getrenv(lua_State* L) {
+    // Return the "real" Roblox environment (main global table)
+    lua_pushglobaltable(L);
+    return 1;
+}
+
+//lua that i imported sadly dosent have setfenv(), getfenv() so these are commented out
+
+//static int RoabaAPI_getfenv(lua_State* L) {
+//    // Standard Lua: getfenv([f | level])
+ //   if (lua_isnoneornil(L, 1)) {
+//        lua_pushinteger(L, 1); // default to level 1
+//    }
+//    else if (lua_isnumber(L, 1)) {
+//        lua_pushvalue(L, 1);
+ //   }
+//    else if (lua_isfunction(L, 1)) {
+//        // keep function on stack
+//    }
+//    else {
+ //       return luaL_error(L, "getfenv expects function, number, or no arg");
+//    }
+//
+//    lua_getfenv(L, -1); // Lua 5.1 / Luau compatible
+ //   return 1;
+//}
+
+//static int RoabaAPI_setfenv(lua_State* L) {
+ //   // Standard Lua: setfenv(f, table)
+//    luaL_checktype(L, 2, LUA_TTABLE);
+//
+//    if (lua_isnumber(L, 1)) {
+//        lua_pushvalue(L, 1);
+//    }
+ //   else if (lua_isfunction(L, 1)) {
+//        // keep function
+//    }
+//    else {
+ //       return luaL_error(L, "setfenv expects function or level");
+//    }
+//
+//    lua_pushvalue(L, 2); // env table
+//    lua_setfenv(L, -2);  // set it
+//    lua_settop(L, 2);    // return function + env (standard behavior)
+//    return 2;
+//}
+
+//═══════════════════════════════════════════════════════
+// OTHER API STUBS (kept minimal but real)
+//═══════════════════════════════════════════════════════
+
+static int RoabaAPI_newcclosure(lua_State* L) {
+    if (!lua_isfunction(L, 1)) return luaL_error(L, "newcclosure expects function");
+    lua_pushvalue(L, 1);
+    lua_pushcclosure(L, [](lua_State* L) -> int {
+        lua_pushvalue(L, lua_upvalueindex(1));
+        int n = lua_gettop(L) - 1;
+        for (int i = 1; i <= n; ++i) lua_pushvalue(L, i);
+        lua_call(L, n, LUA_MULTRET);
+        return lua_gettop(L);
+        }, 1);
+    return 1;
+}
+
+static int RoabaAPI_getidentity(lua_State* L) {
+    lua_pushinteger(L, g_RoabaState ? g_RoabaState->identity : 2); // default level 2
+    return 1;
+}
+
+static int RoabaAPI_Drawing_new(lua_State* L) {
+    const char* type = luaL_checkstring(L, 1);
+    lua_newtable(L);
+    lua_pushboolean(L, true); lua_setfield(L, -2, "Visible");
+    lua_pushnumber(L, 1.0);   lua_setfield(L, -2, "Transparency");
+
+    lua_newtable(L);
+    lua_pushnumber(L, 255); lua_setfield(L, -2, "R");
+    lua_pushnumber(L, 255); lua_setfield(L, -2, "G");
+    lua_pushnumber(L, 255); lua_setfield(L, -2, "B");
+    lua_setfield(L, -2, "Color");
+
+    if (_stricmp(type, "Line") == 0) {
+        lua_newtable(L); lua_pushnumber(L, 0); lua_setfield(L, -2, "X"); lua_pushnumber(L, 0); lua_setfield(L, -2, "Y"); lua_setfield(L, -2, "From");
+        lua_newtable(L); lua_pushnumber(L, 100); lua_setfield(L, -2, "X"); lua_pushnumber(L, 100); lua_setfield(L, -2, "Y"); lua_setfield(L, -2, "To");
+    }
+
+    return 1;
+}
+
+static void RegisterRoabaAPI(lua_State* L) {
+    if (!L) return;
+
+    cout << "[API] Registering environment + other functions..." << endl;
+
+    lua_register(L, "getgenv", RoabaAPI_getgenv);
+    lua_register(L, "getrenv", RoabaAPI_getrenv);
+    //lua_register(L, "getfenv", RoabaAPI_getfenv);
+    //lua_register(L, "setfenv", RoabaAPI_setfenv);
+    lua_register(L, "newcclosure", RoabaAPI_newcclosure);
+    lua_register(L, "getidentity", RoabaAPI_getidentity);
+
+    lua_newtable(L);
+    lua_pushcfunction(L, RoabaAPI_Drawing_new);
+    lua_setfield(L, -2, "new");
+    lua_setglobal(L, "Drawing");
+
+    cout << "[API] Environment functions ready." << endl;
+}
+
+//═══════════════════════════════════════════════════════
+// CREATE STATES (real setup)
+//═══════════════════════════════════════════════════════
+static lua_State* CreateMainLuauState() {
+    lua_State* L = luaL_newstate();
+    if (!L) return nullptr;
+    luaL_openlibs(L);
+
+    // Fake Roblox globals
+    lua_newtable(L);
+    lua_pushstring(L, "Players"); lua_setfield(L, -2, "Players");
+    lua_setglobal(L, "game");
+
+    return L;
+}
+
+static void SetupExploitEnv() {
+    lua_State* L = g_RoabaState->mainState;
+
+    // Create exploit globals table
+    lua_newtable(L);
+    int exploitTableRef = luaL_ref(L, LUA_REGISTRYINDEX); // store in registry
+
+    // Create metatable for fallback
+    lua_newtable(L);
+    lua_pushvalue(L, -1); lua_setfield(L, -2, "__index"); // self as fallback? no
+    lua_pushvalue(L, -1); // duplicate mt
+    lua_pushlightuserdata(L, (void*)(intptr_t)exploitTableRef);
+    lua_gettable(L, LUA_REGISTRYINDEX); // push exploit table
+    lua_pushglobaltable(L);             // push renv = _G
+    lua_pushcclosure(L, genv_index, 2); // upvalues: exploit table + renv
+    lua_setfield(L, -2, "__index");
+    lua_setmetatable(L, -2); // set mt on exploit table
+
+    // Store reference
+    g_RoabaState->exploitEnv = (lua_State*)(intptr_t)exploitTableRef; // abuse as ref key
+}
+
+//═══════════════════════════════════════════════════════
+// MAIN THREAD
+//═══════════════════════════════════════════════════════
 DWORD WINAPI RoabaMain(LPVOID lpParam) {
-    // Setup console
     AllocConsole();
-    FILE* f;
-    freopen_s(&f, "CONOUT$", "w", stdout);
-    freopen_s(&f, "CONIN$", "r", stdin);
+    FILE* dummy;
+    freopen_s(&dummy, "CONOUT$", "w", stdout);
+    freopen_s(&dummy, "CONIN$", "r", stdin);
 
-    // Splash
-    system("color 0E"); // Yellow on black
-    cout << "╔═════════════════════════════════════════╗" << endl;
-    cout << "║                                         ║" << endl;
-    cout << "║      🛞 ROABA BAGATA IN PROCES! 🛞     ║" << endl;
-    cout << "║                                         ║" << endl;
-    cout << "║          The roaba is inside!           ║" << endl;
-    cout << "║                                         ║" << endl;
-    cout << "╚═════════════════════════════════════════╝\n" << endl;
+    cout << "\nROABA X v" << ROABA_VERSION << " - full env support\n\n";
 
-    cout << "[+] DLL loaded successfully!" << endl;
-    cout << "[+] Base Address: 0x" << hex << (DWORD64)GetModuleHandle(NULL) << dec << endl;
-    cout << "[+] Proces ID: " << GetCurrentProcessId() << endl;
+    g_RoabaState = new RoabaState();
+    if (!g_RoabaState) {
+        // optional: log something
+        FreeConsole();
+        FreeLibraryAndExitThread((HMODULE)lpParam, 0);
+        return 0;
+    }
 
-    Sleep(1000);
+    g_RoabaState->mainState = CreateMainLuauState();
 
-    // Main loop
-    bool running = true;
-    while (running) {
-        ShowMenu();
+    if (!g_RoabaState->mainState) {
+        cout << "Failed to create main Luau state\n";
+        FreeConsole();
+        FreeLibraryAndExitThread((HMODULE)lpParam, 0);
+        return 0;
+    }
 
-        int choice;
-        cout << "\n🔧 Alegere: ";
-        cin >> choice;
-        cin.ignore();
+    SetupExploitEnv();
 
-        switch (choice) {
-        case 1:
-            ReadMemoryExample();
-            break;
-        case 2:
-            WriteMemoryExample();
-            break;
-        case 3:
-            ScanMemoryExample();
-            break;
-        case 4:
-            cout << "\n[+] Bagam roaba in boschetsi..." << endl;
-            running = false;
-            break;
-        default:
-            cout << "[!] esti bun" << endl;
-            break;
+    RegisterRoabaAPI(g_RoabaState->mainState);
+
+    cout << "Ready. Try:\n";
+    cout << "  exec print(getrenv().game)\n";
+    cout << "  exec getgenv().myvar = 1337; print(getgenv().myvar)\n";
+    cout << "  exec print(getfenv(print))\n";
+    cout << "  exec exit\n\n";
+
+    string line;
+    while (true) {
+        cout << "ROABA> ";
+        if (!getline(cin, line)) break;
+
+        if (line == "exit") break;
+
+        if (line.rfind("exec ", 0) == 0) {
+            string code = line.substr(5);
+            lua_State* L = g_RoabaState->mainState;
+
+            int err = luaL_loadstring(L, code.c_str());
+            if (err) {
+                cout << "Load error: " << lua_tostring(L, -1) << "\n";
+                lua_pop(L, 1);
+                continue;
+            }
+
+            err = lua_pcall(L, 0, LUA_MULTRET, 0);
+            if (err) {
+                cout << "Runtime error: " << lua_tostring(L, -1) << "\n";
+                lua_pop(L, 1);
+            }
+
+            int n = lua_gettop(L);
+            if (n > 0) {
+                cout << "→ ";
+                for (int i = 1; i <= n; ++i) {
+                    cout << (lua_tostring(L, i) ? lua_tostring(L, i) : luaL_typename(L, i)) << (i < n ? "  " : "");
+                }
+                cout << "\n";
+                lua_settop(L, 0);
+            }
         }
     }
 
-    // Cleanup
-    Sleep(500);
-    fclose(stdout);
-    fclose(stdin);
+cleanup:
+    if (g_RoabaState) {
+        if (g_RoabaState->mainState) lua_close(g_RoabaState->mainState);
+        delete g_RoabaState;
+    }
     FreeConsole();
     FreeLibraryAndExitThread((HMODULE)lpParam, 0);
     return 0;
 }
 
-void ShowMenu() {
-    cout << "\n╔═══════════════════════════════════╗" << endl;
-    cout << "║        🛞 MENIU ROABA 🛞          ║" << endl;
-    cout << "╚═══════════════════════════════════╝" << endl;
-    cout << "[1] ?? Read memory" << endl;
-    cout << "[2] ??  Write memory" << endl;
-    cout << "[3] ?? Scan memory" << endl;
-    cout << "[4] ?? Unload DLL" << endl;
-}
-
-void ReadMemoryExample() {
-    cout << "\n📍 Adresa (hex): 0x";
-    DWORD64 address;
-    cin >> hex >> address >> dec;
-
-    cout << "📏 Bytes sa citesti (ca pe gagici :) ): ";
-    int size;
-    cin >> size;
-    cin.ignore();
-
-    cout << "\n[+] Citim " << size << " bytes de la 0x" << hex << address << dec << "..." << endl;
-
-    try {
-        BYTE* buffer = new BYTE[size];
-        memcpy(buffer, (void*)address, size);
-
-        cout << "\n📦 Roaba:\n" << endl;
-        for (int i = 0; i < size; i += 16) {
-            printf("0x%08llX  ", address + i);
-
-            // Hex
-            for (int j = 0; j < 16 && i + j < size; j++) {
-                printf("%02X ", buffer[i + j]);
-            }
-
-            // Padding
-            for (int j = size - i; j < 16; j++) {
-                printf("   ");
-            }
-
-            cout << " ";
-
-            // ASCII
-            for (int j = 0; j < 16 && i + j < size; j++) {
-                char c = buffer[i + j];
-                printf("%c", (c >= 32 && c <= 126) ? c : '.');
-            }
-
-            cout << endl;
-        }
-
-        delete[] buffer;
-        cout << "\n[+] Am terminat de citi" << endl;
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hModule);
+        CreateThread(nullptr, 0, RoabaMain, hModule, 0, nullptr);
     }
-    catch (...) {
-        cout << "[-] am dato in bara cu memoria si am si violat (nu gagici de data asta D: ) permisiunile de memorie" << endl;
-    }
-}
-
-void WriteMemoryExample() {
-    cout << "\n📍 Adresa (hex): 0x";
-    DWORD64 address;
-    cin >> hex >> address >> dec;
-
-    cout << "\n?? Tipul de valoare:" << endl;
-    cout << "[1] Integer (4 bytes)" << endl;
-    cout << "[2] Float (4 bytes)" << endl;
-    cout << "[3] Bytes (hex)" << endl;
-    cout << "Choice: ";
-
-    int choice;
-    cin >> choice;
-
-    try {
-        DWORD oldProtect;
-
-        switch (choice) {
-        case 1: {
-            cout << "Valoare (int): ";
-            int value;
-            cin >> value;
-
-            VirtualProtect((LPVOID)address, sizeof(int), PAGE_EXECUTE_READWRITE, &oldProtect);
-            *(int*)address = value;
-            VirtualProtect((LPVOID)address, sizeof(int), oldProtect, &oldProtect);
-
-            cout << "\n[+] Scris " << value << " la 0x" << hex << address << dec << endl;
-            break;
-        }
-        case 2: {
-            cout << "Valoare (float): ";
-            float value;
-            cin >> value;
-
-            VirtualProtect((LPVOID)address, sizeof(float), PAGE_EXECUTE_READWRITE, &oldProtect);
-            *(float*)address = value;
-            VirtualProtect((LPVOID)address, sizeof(float), oldProtect, &oldProtect);
-
-            cout << "\n[+] Scris " << value << " la 0x" << hex << address << dec << endl;
-            break;
-        }
-        case 3: {
-            cout << "Bytesi (hex, e.g., 90 90 90): ";
-            cin.ignore();
-            string hexInput;
-            getline(cin, hexInput);
-
-            vector<BYTE> bytes;
-            stringstream ss(hexInput);
-            string byteStr;
-            while (ss >> byteStr) {
-                bytes.push_back((BYTE)stoi(byteStr, nullptr, 16));
-            }
-
-            VirtualProtect((LPVOID)address, bytes.size(), PAGE_EXECUTE_READWRITE, &oldProtect);
-            memcpy((void*)address, bytes.data(), bytes.size());
-            VirtualProtect((LPVOID)address, bytes.size(), oldProtect, &oldProtect);
-
-            cout << "\n[+] Scris " << bytes.size() << " bytes la 0x" << hex << address << dec << endl;
-            break;
-        }
-        }
-    }
-    catch (...) {
-        cout << "[-] Am dato in bara cu memoria dinou :(" << endl;
-    }
-}
-
-void ScanMemoryExample() {
-    cout << "\n🔍 Valoare sa scanam (int): ";
-    int valueToFind;
-    cin >> valueToFind;
-
-    cout << "\n[+] Scanare memorie..." << endl;
-    cout << "[+] E roaba ruginita deci va lua cv timp! ??" << endl;
-
-    vector<DWORD64> results;
-
-    MEMORY_BASIC_INFORMATION mbi;
-    DWORD64 address = 0;
-
-    while (VirtualQuery((LPCVOID)address, &mbi, sizeof(mbi))) {
-        if (mbi.State == MEM_COMMIT &&
-            (mbi.Protect == PAGE_READWRITE || mbi.Protect == PAGE_EXECUTE_READWRITE)) {
-
-            try {
-                BYTE* buffer = new BYTE[mbi.RegionSize];
-                memcpy(buffer, mbi.BaseAddress, mbi.RegionSize);
-
-                for (size_t i = 0; i < mbi.RegionSize - 3; i++) {
-                    if (*(int*)(buffer + i) == valueToFind) {
-                        results.push_back((DWORD64)mbi.BaseAddress + i);
-                    }
-                }
-
-                delete[] buffer;
-            }
-            catch (...) {
-                // Skip inaccessible regions
-            }
-        }
-
-        address = (DWORD64)mbi.BaseAddress + mbi.RegionSize;
-    }
-
-    cout << "\n[+] Am gasit " << results.size() << " resultate!\n" << endl;
-
-    if (results.size() > 0) {
-        cout << "📍 Adrese:" << endl;
-        for (size_t i = 0; i < min(results.size(), (size_t)20); i++) {
-            cout << "  [0x" << hex << results[i] << dec << "] = " << valueToFind << endl;
-        }
-
-        if (results.size() > 20) {
-            cout << "  ... si " << (results.size() - 20) << " mai mult(e)" << endl;
-        }
-    }
+    return TRUE;
 }
