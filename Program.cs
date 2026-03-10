@@ -9,10 +9,436 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Xml.Linq;
+using static Roaba_Matii.AdvancedThreadPoolDetector;
 
 
 namespace Roaba_Matii
 {
+    public class Settings
+    {
+        public static bool isRobloxOffsetEnabled = false;
+        public static bool isAlertableOnly = false;
+    }
+
+    public class AdvancedThreadPoolDetector
+    {
+        // ═══════════════════════════════════════════════════════
+        // STRUCTURES
+        // ═══════════════════════════════════════════════════════
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct THREAD_POOL_INFORMATION
+        {
+            public bool IsPoolThread;  // True if thread is from pool
+            public IntPtr PoolId;      // Pool identifier
+            public uint Flags;         // Additional flags
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct THREAD_BASIC_INFORMATION
+        {
+            public int ExitStatus;
+            public IntPtr TebBaseAddress;
+            public CLIENT_ID ClientId;
+            public IntPtr AffinityMask;
+            public int Priority;
+            public int BasePriority;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct CLIENT_ID
+        {
+            public IntPtr UniqueProcess;
+            public IntPtr UniqueThread;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct THREADENTRY32
+        {
+            public uint dwSize;
+            public uint cntUsage;
+            public uint th32ThreadID;
+            public uint th32OwnerProcessID;
+            public int tpBasePri;
+            public int tpDeltaPri;
+            public uint dwFlags;
+        }
+
+        [StructLayout(LayoutKind.Sequential, Pack = 16)]
+        public struct CONTEXT64
+        {
+            public ulong P1Home, P2Home, P3Home, P4Home, P5Home, P6Home;
+            public uint ContextFlags;
+            public uint MxCsr;
+            public ushort SegCs, SegDs, SegEs, SegFs, SegGs, SegSs;
+            public uint EFlags;
+            public ulong Dr0, Dr1, Dr2, Dr3, Dr6, Dr7;
+            public ulong Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi;
+            public ulong R8, R9, R10, R11, R12, R13, R14, R15;
+            public ulong Rip;
+            // minimal version is enough for Rip/Rsp manipulation
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // P/INVOKE
+        // ═══════════════════════════════════════════════════════
+
+        [DllImport("ntdll.dll")]
+        public static extern int NtQueryInformationThread(
+            IntPtr ThreadHandle,
+            int ThreadInformationClass,
+            IntPtr ThreadInformation,
+            uint ThreadInformationLength,
+            out uint ReturnLength
+        );
+
+        [DllImport("kernel32.dll")]
+        static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
+
+        [DllImport("kernel32.dll")]
+        static extern bool Thread32First(IntPtr hSnapshot, ref THREADENTRY32 lpte);
+
+        [DllImport("kernel32.dll")]
+        static extern bool Thread32Next(IntPtr hSnapshot, ref THREADENTRY32 lpte);
+
+        [DllImport("kernel32.dll")]
+        static extern IntPtr OpenThread(uint dwDesiredAccess, bool bInheritHandle, uint dwThreadId);
+
+        [DllImport("kernel32.dll")]
+        static extern bool GetThreadContext(IntPtr hThread, ref CONTEXT64 lpContext);
+
+        [DllImport("kernel32.dll")]
+        static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll")]
+        static extern uint GetThreadId(IntPtr hThread);
+
+        // ═══════════════════════════════════════════════════════
+        // CONSTANTS
+        // ═══════════════════════════════════════════════════════
+
+        const uint TH32CS_SNAPTHREAD = 0x00000004;
+        const uint THREAD_ALL_ACCESS = 0x001F03FF;
+        const uint CONTEXT_FULL = 0x10000F;
+
+        const int ThreadPoolInformation = 0x26;
+        const int ThreadBasicInformation = 0x00;
+
+        // ═══════════════════════════════════════════════════════
+        // THREAD POOL DETECTION
+        // ═══════════════════════════════════════════════════════
+
+        bool OffsetsEnabled = Settings.isRobloxOffsetEnabled;
+        bool AlertableOnly = Settings.isAlertableOnly;
+        bool Verbose = true;
+
+        public static List<uint> FindAdvancedThreadPools(
+            Process targetProcess,
+            bool alertableOnly = false, //change to true if roblox
+            bool robloxHeuristics = false, //change to true if roblox
+            bool verbose = true
+        )
+        {
+            List<uint> poolThreads = new List<uint>();
+
+            Console.WriteLine("\n╔═══════════════════════════════════════════════════╗");
+            Console.WriteLine("║   🔍 ADVANCED THREAD POOL DETECTION 🔍          ║");
+            Console.WriteLine("╚═══════════════════════════════════════════════════╝\n");
+
+            if (verbose)
+            {
+                Console.WriteLine($"[SCAN] Target Process: {targetProcess.ProcessName} (PID: {targetProcess.Id})");
+                Console.WriteLine($"[SCAN] Filters: Alertable={alertableOnly}, RobloxHeuristics={robloxHeuristics}");
+                Console.WriteLine($"[SCAN] Scanning system threads...\n");
+            }
+
+            IntPtr snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if (snap == IntPtr.Zero)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("[-] CreateToolhelp32Snapshot failed!");
+                Console.ResetColor();
+                return poolThreads;
+            }
+
+            THREADENTRY32 te = new THREADENTRY32
+            {
+                dwSize = (uint)Marshal.SizeOf<THREADENTRY32>()
+            };
+
+            if (!Thread32First(snap, ref te))
+            {
+                Console.WriteLine("[-] Thread32First failed!");
+                CloseHandle(snap);
+                return poolThreads;
+            }
+
+            int totalThreads = 0;
+            int processThreads = 0;
+            int poolCandidates = 0;
+
+            do
+            {
+                totalThreads++;
+
+                if (te.th32OwnerProcessID == (uint)targetProcess.Id)
+                {
+                    processThreads++;
+
+                    IntPtr hThread = OpenThread(THREAD_ALL_ACCESS, false, te.th32ThreadID);
+                    if (hThread != IntPtr.Zero)
+                    {
+                        try
+                        {
+                            // ═══════════════════════════════════════════════════════
+                            // CHECK 1: Is it a pool thread? (Kernel-level check)
+                            // ═══════════════════════════════════════════════════════
+
+                            IntPtr infoPtr = Marshal.AllocHGlobal(Marshal.SizeOf<THREAD_POOL_INFORMATION>());
+                            uint retLen;
+
+                            int status = NtQueryInformationThread(
+                                hThread,
+                                ThreadPoolInformation,
+                                infoPtr,
+                                (uint)Marshal.SizeOf<THREAD_POOL_INFORMATION>(),
+                                out retLen
+                            );
+
+                            if (status == 0)
+                            {
+                                THREAD_POOL_INFORMATION poolInfo = Marshal.PtrToStructure<THREAD_POOL_INFORMATION>(infoPtr);
+
+                                if (poolInfo.IsPoolThread)
+                                {
+                                    poolCandidates++;
+
+                                    // ═══════════════════════════════════════════════════════
+                                    // CHECK 2: Get thread context (RIP, RSP, etc.)
+                                    // ═══════════════════════════════════════════════════════
+
+                                    CONTEXT64 ctx = new CONTEXT64
+                                    {
+                                        ContextFlags = CONTEXT_FULL
+                                    };
+
+
+                                    if (GetThreadContext(hThread, ref ctx))
+                                    {
+                                    
+                                        bool passesFilters = true;
+
+                                        // ═══════════════════════════════════════════════════════
+                                        // CHECK 3: Roblox-specific heuristics
+                                        // ═══════════════════════════════════════════════════════
+
+                                        if (robloxHeuristics)
+                                        {
+                                            // Filter 1: Thread ID > 1000 (background pools)
+                                            bool validTID = te.th32ThreadID > 1000;
+
+                                            // Filter 2: RIP in valid range (ntdll or Roblox module)
+                                            // Typical range: 0x7FF000000000 - 0x800000000000
+                                            bool validRIP = ctx.Rip > 0x7FF000000000 && ctx.Rip < 0x800000000000;
+
+                                            // Filter 3: RSP looks like a valid stack
+                                            bool validRSP = ctx.Rsp > 0x1000 && ctx.Rsp < 0x7FFFFFFFFFFF;
+
+                                            passesFilters = validTID && validRIP && validRSP;
+
+                                            if (verbose && !passesFilters)
+                                            {
+                                                Console.ForegroundColor = ConsoleColor.Yellow;
+                                                Console.WriteLine($"[FILTER] TID {te.th32ThreadID} failed heuristics:");
+                                                if (!validTID) Console.WriteLine($"  - TID too low: {te.th32ThreadID}");
+                                                if (!validRIP) Console.WriteLine($"  - RIP out of range: 0x{ctx.Rip:X}");
+                                                if (!validRSP) Console.WriteLine($"  - RSP invalid: 0x{ctx.Rsp:X}");
+                                                Console.ResetColor();
+                                            }
+                                        }
+
+                                        // ═══════════════════════════════════════════════════════
+                                        // CHECK 4: Alertable wait state (optional)
+                                        // ═══════════════════════════════════════════════════════
+
+                                        if (alertableOnly)
+                                        {
+                                            // Check if thread is in alertable wait
+                                            // This is indicated by RIP pointing to wait functions in ntdll
+                                            // Common wait functions: NtWaitForSingleObject, NtDelayExecution
+
+                                            bool isWaiting = IsThreadInWaitState(ctx.Rip);
+                                            passesFilters = passesFilters && isWaiting;
+
+                                            if (verbose && !isWaiting)
+                                            {
+                                                Console.ForegroundColor = ConsoleColor.Yellow;
+                                                Console.WriteLine($"[FILTER] TID {te.th32ThreadID} not in wait state (RIP: 0x{ctx.Rip:X})");
+                                                Console.ResetColor();
+                                            }
+                                        }
+
+                                        // ═══════════════════════════════════════════════════════
+                                        // ACCEPT THREAD IF IT PASSES ALL FILTERS
+                                        // ═══════════════════════════════════════════════════════
+
+                                        if (passesFilters)
+                                        {
+                                            poolThreads.Add(te.th32ThreadID);
+
+                                            if (verbose)
+                                            {
+                                                Console.ForegroundColor = ConsoleColor.Green;
+                                                Console.WriteLine($"[✓] Pool Thread Found:");
+                                                Console.WriteLine($"    TID:      {te.th32ThreadID}");
+                                                Console.WriteLine($"    RIP:      0x{ctx.Rip:X16}");
+                                                Console.WriteLine($"    RSP:      0x{ctx.Rsp:X16}");
+                                                Console.WriteLine($"    Priority: {te.tpBasePri}");
+                                                Console.WriteLine($"    PoolID:   0x{poolInfo.PoolId:X}");
+                                                Console.ResetColor();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            Marshal.FreeHGlobal(infoPtr);
+                        }
+                        catch (Exception ex)
+                        {
+                            if (verbose)
+                            {
+                                Console.ForegroundColor = ConsoleColor.Red;
+                                Console.WriteLine($"[!] Error checking thread {te.th32ThreadID}: {ex.Message}");
+                                Console.ResetColor();
+                            }
+                        }
+                        finally
+                        {
+                            CloseHandle(hThread);
+                        }
+                    }
+                }
+            }
+            while (Thread32Next(snap, ref te));
+
+            CloseHandle(snap);
+
+            // ═══════════════════════════════════════════════════════
+            // RESULTS SUMMARY
+            // ═══════════════════════════════════════════════════════
+
+            Console.WriteLine("\n╔═══════════════════════════════════════════════════╗");
+            Console.WriteLine("║             SCAN RESULTS                          ║");
+            Console.WriteLine("╚═══════════════════════════════════════════════════╝");
+            Console.WriteLine($"Total System Threads:    {totalThreads}");
+            Console.WriteLine($"Target Process Threads:  {processThreads}");
+            Console.WriteLine($"Pool Thread Candidates:  {poolCandidates}");
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"✓ Passed All Filters:    {poolThreads.Count}");
+            Console.ResetColor();
+            Console.WriteLine();
+
+            if (poolThreads.Count == 0)
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("[!] No suitable pool threads found!");
+                Console.WriteLine("[!] Recommendations:");
+                Console.WriteLine("    - Try disabling alertableOnly filter");
+                Console.WriteLine("    - Try disabling robloxHeuristics");
+                Console.WriteLine("    - Wait a few seconds and retry (threads may be busy)");
+                Console.ResetColor();
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[GARCEA]: Boss, am gasit {poolThreads.Count} thread pool gata de hijack!");
+                Console.ResetColor();
+            }
+
+            return poolThreads;
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // HELPER: Check if thread is in wait state
+        // ═══════════════════════════════════════════════════════
+
+        private static bool IsThreadInWaitState(ulong rip)
+        {
+            // Get ntdll base address
+            IntPtr ntdll = GetModuleHandle("ntdll.dll");
+            if (ntdll == IntPtr.Zero) return false;
+
+            ulong ntdllBase = (ulong)ntdll.ToInt64();
+            ulong ntdllEnd = ntdllBase + 0x200000; // Approximate ntdll size
+
+            // Check if RIP is in ntdll (common for waiting threads)
+            if (rip >= ntdllBase && rip <= ntdllEnd)
+            {
+                // Thread is likely in a wait function
+                return true;
+            }
+
+            // Could also check for specific wait function addresses
+            // But this is good enough for our purposes
+            return false;
+        }
+
+        [DllImport("kernel32.dll")]
+        static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        // ═══════════════════════════════════════════════════════
+        // ADVANCED: Pick the BEST thread to hijack
+        // ═══════════════════════════════════════════════════════
+
+        public static uint? SelectBestThread(List<uint> poolThreads, Process targetProcess)
+        {
+            if (poolThreads.Count == 0) return null;
+
+            Console.WriteLine("\n[SELECT] Analyzing threads to find best hijack target...");
+
+            Dictionary<uint, int> threadScores = new Dictionary<uint, int>();
+
+            foreach (uint tid in poolThreads)
+            {
+                int score = 0;
+
+                IntPtr hThread = OpenThread(THREAD_ALL_ACCESS, false, tid);
+                if (hThread != IntPtr.Zero)
+                {
+                    CONTEXT64 ctx = new CONTEXT64 { ContextFlags = CONTEXT_FULL };
+                    if (GetThreadContext(hThread, ref ctx))
+                    {
+                        // Prefer threads with TID in "sweet spot" (1000-5000)
+                        if (tid > 1000 && tid < 5000) score += 10;
+
+                        // Prefer threads in ntdll wait (more stable)
+                        if (IsThreadInWaitState(ctx.Rip)) score += 20;
+
+                        // Prefer threads with normal priority
+                        ProcessThread pt = targetProcess.Threads.Cast<ProcessThread>()
+                            .FirstOrDefault(t => t.Id == tid);
+                        if (pt != null)
+                        {
+                            if (pt.PriorityLevel == ThreadPriorityLevel.Normal) score += 15;
+                        }
+                    }
+                    CloseHandle(hThread);
+                }
+
+                threadScores[tid] = score;
+            }
+
+            // Select thread with highest score
+            var best = threadScores.OrderByDescending(kvp => kvp.Value).First();
+
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"[SELECT] ✓ Best thread: TID {best.Key} (score: {best.Value})");
+            Console.ResetColor();
+
+            return best.Key;
+        }
+    }
     class RoabaPipe
     {
         private static Thread pipeThread = null;
@@ -80,6 +506,7 @@ namespace Roaba_Matii
                     case "SCAN": PipeScanValue(data); break;
                     case "PATTERN": PipePatternScan(data); break;
                     case "INFO": PipeProcessInfo(); break;
+                    case "EXEC": break;
                     default:
                         lock (RoabaX.ConsoleLock) Console.WriteLine($"[!] Comanda proasta: {cmd}");
                         break;
@@ -891,7 +1318,7 @@ namespace Roaba_Matii
 
             if (status == 0)
             {
-                Console.WriteLine("[STEALTH] Created stealth thread");
+                Console.WriteLine("Created stealth thread");
                 return hThread;
             }
 
@@ -910,13 +1337,13 @@ namespace Roaba_Matii
             if (DetectSuspiciousProcesses())
             {
                 Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine("⚠️  Proces suspicios detektat");
+                Console.WriteLine("Proces suspicios detektat");
                 Console.ResetColor();
             }
             else
             {
                 Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine("✅ Nu eggzista procese suspicioase");
+                Console.WriteLine("Nu eggzista procese suspicioase");
                 Console.ResetColor();
             }
 
@@ -924,13 +1351,13 @@ namespace Roaba_Matii
             if (DetectHypervisor())
             {
                 Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine("⚠️  DETEKTAT");
+                Console.WriteLine("DETEKTAT");
                 Console.ResetColor();
             }
             else
             {
                 Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine("✅ Nu is cam. de supraveghere");
+                Console.WriteLine("Nu is cam. de supraveghere");
                 Console.ResetColor();
             }
 
@@ -945,12 +1372,12 @@ namespace Roaba_Matii
 
             Console.Write("[6/7] Encriptiones initialized... ");
             Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine("✅ gata bos");
+            Console.WriteLine("gata bos");
             Console.ResetColor();
 
             Console.Write("[7/7] Motor 4D initializat... ");
             Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine("✅ gata bos");
+            Console.WriteLine("gata bos");
             Console.ResetColor();
 
             Console.ForegroundColor = ConsoleColor.Magenta;
@@ -1042,6 +1469,55 @@ namespace Roaba_Matii
         public static IntPtr processHandle = IntPtr.Zero;
         public static Process targetProcess = null;
 
+        public static bool StealthWrite(IntPtr address, byte[] data)
+        {
+            uint written = 0;
+            uint size = (uint)data.Length;
+            uint status = NtWriteVirtualMemory(processHandle, address, data, size, out written);
+            return status == 0 && written == size;
+        }
+
+        public static bool StealthProtect(IntPtr address, uint size, uint newProtect, out uint oldProtect)
+        {
+            oldProtect = 0;
+            IntPtr baseAddr = address;
+            uint regionSize = size;
+            uint status = NtProtectVirtualMemory(processHandle, ref baseAddr, ref regionSize, newProtect, out oldProtect);
+            return status == 0;
+        }
+        public static IntPtr StealthAlloc(uint size, uint protect = 0x04)  // ← default to PAGE_READWRITE instead of 0x40
+        {
+            IntPtr baseAddr = IntPtr.Zero;
+            uint regionSize = size;
+            uint status = NtAllocateVirtualMemory(processHandle, ref baseAddr, IntPtr.Zero, ref regionSize, 0x3000, protect);
+
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"[ALLOC] NtAllocateVirtualMemory(size={size:X}, protect=0x{protect:X}) → NTSTATUS 0x{status:X8}");
+
+            if (status != 0)
+            {
+                string msg = status switch
+                {
+                    0xC0000022 => "Access Denied (Hyperion blocked RWX alloc)",
+                    0xC0000005 => "Access Violation / bad handle/pointer",
+                    0xC00000F0 => "Invalid Parameter",
+                    0xC0000018 => "Already Committed / conflict",
+                    _ => $"Unknown error (check NTSTATUS docs)"
+                };
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"[ALLOC FAIL] {msg}");
+                Console.ResetColor();
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[ALLOC OK] → 0x{baseAddr.ToString("X")}");
+                Console.ResetColor();
+            }
+
+            return status == 0 ? baseAddr : IntPtr.Zero;
+        }
+
         class RoabaBurlan
         {
             [DllImport("kernel32.dll")]
@@ -1084,109 +1560,180 @@ namespace Roaba_Matii
             const uint CONTEXT_ALL = 0x10000F;
 
             static readonly byte[] Shellcode = {
-                0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x48, 0xC7, 0xC2, 0x01, 0x00, 0x00, 0x00,
-                0x49, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00,
-                0xFF, 0xD0,
-                0xC3
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov rax, <dllMain>
+            0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov rcx, <dllBase>
+            0x48, 0xC7, 0xC2, 0x01, 0x00, 0x00, 0x00,                    // mov rdx, 1
+            0x49, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00,                    // mov r8, 0
+            0xFF, 0xD0,                                                   // call rax
+            0xC3                                                          // ret
             };
 
             public static bool InjectBurlan(IntPtr processHandle, Process targetProcess, string dllPath)
             {
                 if (!File.Exists(dllPath))
                 {
+                    Console.ForegroundColor = ConsoleColor.Red;
                     Console.WriteLine("[-] DLL not found");
+                    Console.ResetColor();
                     return false;
                 }
 
                 byte[] dllBytes = File.ReadAllBytes(dllPath);
+                Console.WriteLine($"[BURLAN] DLL Size: {dllBytes.Length} bytes");
 
+                // Allocate memory for DLL
                 IntPtr allocated = RoabaX.StealthAlloc((uint)dllBytes.Length + 0x1000);
                 if (allocated == IntPtr.Zero)
                 {
-                    Console.WriteLine("[-] Alloc failed");
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("[-] Allocation failed");
+                    Console.ResetColor();
                     return false;
                 }
 
-                RoabaX.StealthWrite(allocated, dllBytes);
+                Console.WriteLine($"[BURLAN] Allocated at: 0x{allocated:X}");
 
+                Console.WriteLine("[BURLAN] DLL written successfully");
+
+                // Get entry point
                 int peOffset = BitConverter.ToInt32(dllBytes, 0x3C);
                 int entryPointRVA = BitConverter.ToInt32(dllBytes, peOffset + 0x28);
                 IntPtr dllMain = allocated + entryPointRVA;
 
+                Console.WriteLine($"[BURLAN] Entry Point: 0x{dllMain:X}");
+
+                // Prepare shellcode
                 byte[] sc = (byte[])Shellcode.Clone();
-                BitConverter.GetBytes(dllMain.ToInt64()).CopyTo(sc, 2);
-                BitConverter.GetBytes(allocated.ToInt64()).CopyTo(sc, 12);
+                BitConverter.GetBytes(dllMain.ToInt64()).CopyTo(sc, 2);      // mov rax, dllMain
+                BitConverter.GetBytes(allocated.ToInt64()).CopyTo(sc, 12);    // mov rcx, dllBase
 
+                // Write shellcode after DLL
                 IntPtr shellAddr = allocated + dllBytes.Length;
-                RoabaX.StealthWrite(shellAddr, sc);
+                if (!RoabaX.StealthWrite(shellAddr, sc))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("[-] Shellcode write failed");
+                    Console.ResetColor();
+                    return false;
+                }
 
+                Console.WriteLine($"[BURLAN] Shellcode at: 0x{shellAddr:X}");
+
+                // Get threads
                 var threads = new List<uint>();
                 foreach (ProcessThread t in targetProcess.Threads)
                     threads.Add((uint)t.Id);
 
                 if (threads.Count == 0)
                 {
+                    Console.ForegroundColor = ConsoleColor.Red;
                     Console.WriteLine("[-] No threads found");
+                    Console.ResetColor();
                     return false;
                 }
 
+                Console.WriteLine($"[BURLAN] Found {threads.Count} threads, using first one");
+
+                // Open thread
                 IntPtr hThread = OpenThread(THREAD_ALL_ACCESS, false, threads[0]);
                 if (hThread == IntPtr.Zero)
                 {
-                    Console.WriteLine("[-] OpenThread failed");
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"[-] OpenThread failed: {Marshal.GetLastWin32Error()}");
+                    Console.ResetColor();
                     return false;
                 }
 
-                SuspendThread(hThread);
+                // Suspend thread
+                uint suspendResult = SuspendThread(hThread);
+                if (suspendResult == uint.MaxValue)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"[-] SuspendThread failed: {Marshal.GetLastWin32Error()}");
+                    CloseHandle(hThread);
+                    Console.ResetColor();
+                    return false;
+                }
 
+                Console.WriteLine($"[BURLAN] Thread {threads[0]} suspended (suspend count: {suspendResult})");
+
+                // Get context
                 CONTEXT64 ctx = new CONTEXT64 { ContextFlags = CONTEXT_ALL };
-                GetThreadContext(hThread, ref ctx);
+                if (!GetThreadContext(hThread, ref ctx))
+                {
+                    Console.WriteLine($"[-] GetThreadContext failed: {Marshal.GetLastWin32Error()}");
+                    ResumeThread(hThread);
+                    CloseHandle(hThread);
+                    return false;
+                }
+                bool success = GetThreadContext(hThread, ref ctx);
+                if (!success)
+                {
+                    int err = Marshal.GetLastWin32Error(); // MUST be right after the call
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"[-] GetThreadContext failed with Win32 error: {err} (5=AccessDenied, 998=InvalidAccess, 87=BadParam)");
+                    Console.ResetColor();
 
-                ulong oldRip = ctx.Rip;
+                    // Optional: more info
+                    if (err == 5 || err == 998)
+                        Console.WriteLine("    → Thread is likely protected by Byfron or Windows (common on Roblox)");
+
+                    ResumeThread(hThread);
+                    CloseHandle(hThread);
+                    return false;
+                }
+                Console.WriteLine($"[BURLAN] Old RIP: 0x{ctx.Rip:X} | RSP: 0x{ctx.Rsp:X}");
+
+                // Push old RIP to stack
                 ctx.Rsp -= 8;
-                RoabaX.StealthWrite((IntPtr)ctx.Rsp, BitConverter.GetBytes(oldRip));
+                byte[] oldRipBytes = BitConverter.GetBytes(ctx.Rip);
+                if (!RoabaX.StealthWrite((IntPtr)ctx.Rsp, oldRipBytes))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("[-] Failed to push old RIP to stack");
+                    ResumeThread(hThread);
+                    CloseHandle(hThread);
+                    Console.ResetColor();
+                    return false;
+                }
 
+                Console.WriteLine($"[BURLAN] Pushed old RIP to stack at 0x{ctx.Rsp:X}");
+
+                // Set new RIP to shellcode
                 ctx.Rip = (ulong)shellAddr.ToInt64();
 
-                SetThreadContext(hThread, ref ctx);
-                ResumeThread(hThread);
+                // Set context
+                if (!SetThreadContext(hThread, ref ctx))
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"[-] SetThreadContext failed: {err}");
+                    if (err == 998)
+                        Console.WriteLine("[-] Error 998 = NOACCESS - thread is protected!");
+                    ResumeThread(hThread);
+                    CloseHandle(hThread);
+                    Console.ResetColor();
+                    return false;
+                }
 
-                Console.ForegroundColor = ConsoleColor.Magenta;
-                Console.WriteLine($"[+] BURLAN INJECTED! Mapped @ 0x{allocated.ToString("X")} | Hijacked thread {threads[0]}");
+                Console.WriteLine($"[BURLAN] New RIP: 0x{ctx.Rip:X}");
+
+                // Resume thread
+                ResumeThread(hThread);
+                CloseHandle(hThread);
+
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"\n[BURLAN] ✅ INJECTION SUCCESSFUL!");
+                Console.WriteLine($"[BURLAN] Mapped @ 0x{allocated:X}");
+                Console.WriteLine($"[BURLAN] Hijacked thread {threads[0]}");
+                Console.WriteLine($"[BURLAN] DllMain will execute on next thread wake");
                 Console.ResetColor();
 
-                CloseHandle(hThread);
                 return true;
             }
         }
-
-        public static bool StealthWrite(IntPtr address, byte[] data)
-        {
-            uint written = 0;
-            uint size = (uint)data.Length;
-            uint status = NtWriteVirtualMemory(processHandle, address, data, size, out written);
-            return status == 0 && written == size;
-        }
-
-        public static bool StealthProtect(IntPtr address, uint size, uint newProtect, out uint oldProtect)
-        {
-            oldProtect = 0;
-            IntPtr baseAddr = address;
-            uint regionSize = size;
-            uint status = NtProtectVirtualMemory(processHandle, ref baseAddr, ref regionSize, newProtect, out oldProtect);
-            return status == 0;
-        }
-
-        public static IntPtr StealthAlloc(uint size, uint protect = 0x40)
-        {
-            IntPtr baseAddr = IntPtr.Zero;
-            uint regionSize = size;
-            uint status = NtAllocateVirtualMemory(processHandle, ref baseAddr, IntPtr.Zero, ref regionSize, 0x3000, protect);
-            return status == 0 ? baseAddr : IntPtr.Zero;
-        }
-
+        
+        
         static void SendPipeCommand(string command)
         {
             try
@@ -1353,9 +1900,12 @@ namespace Roaba_Matii
         }
         static void InjectStealth()
         {
-            Console.Write("\n[?] Path to DLL (or enter for TrabantXEngine.dll): ");
-            string dllPath = Console.ReadLine();
+            Console.WriteLine("\n╔═══════════════════════════════════════════════════╗");
+            Console.WriteLine("║    🛞 ROABA X - ADVANCED INJECTION 🛞            ║");
+            Console.WriteLine("╚═══════════════════════════════════════════════════╝\n");
 
+            Console.Write("[?] Path to DLL (default: TrabantXEngine.dll): ");
+            string dllPath = Console.ReadLine();
             if (string.IsNullOrEmpty(dllPath))
                 dllPath = "TrabantXEngine.dll";
 
@@ -1367,52 +1917,557 @@ namespace Roaba_Matii
                 return;
             }
 
-            Console.WriteLine("\n[+] Loading DLL...");
-            byte[] dllBytes = File.ReadAllBytes(dllPath);
+            Console.WriteLine("\n[GARCEA]: Boss, alege metoda de injectie:");
+            Console.WriteLine("[1] Thread Pool APC (★★★★☆ - Xeno/Wave style)");
+            Console.WriteLine("[2] Thread Hijacking (★★★★☆ - Burlan style)");
+            Console.WriteLine("[3] Simple CreateRemoteThread (★★☆☆☆ - detected fast)");
+            Console.WriteLine("[4] Debug Mode (vezi tot procesul)");
+            Console.Write("\nAlege (1-4): ");
 
-            Console.WriteLine("[+] Encrypting payload...");
-            Thread.Sleep(300);
+            string choice = Console.ReadLine();
 
-            Console.WriteLine("[+] Generating polymorphic wrapper...");
-            Thread.Sleep(300);
-
-            Console.WriteLine("[+] Injecting via XENO section method...");
-            IntPtr remoteBase = AntiByfronUltra.InjectViaSection(processHandle, dllBytes);
-
-            if (remoteBase != IntPtr.Zero)
+            switch (choice)
             {
-                int peOffset = BitConverter.ToInt32(dllBytes, 0x3C);
-                int entryPointRVA = BitConverter.ToInt32(dllBytes, peOffset + 0x28);
-                IntPtr entryPoint = remoteBase + entryPointRVA;
+                case "1":
+                    InjectViaThreadPoolAPC(dllPath);
+                    break;
+                case "2":
+                    InjectViaBurlan(dllPath);
+                    break;
+                case "3":
+                    InjectSimple(dllPath);
+                    break;
+                case "4":
+                    InjectDebug(dllPath);
+                    break;
+                default:
+                    Console.WriteLine("[!] Invalid choice, using Thread Pool APC...");
+                    InjectViaThreadPoolAPC(dllPath);
+                    break;
+            }
+        }
 
-                Console.WriteLine($"[+] Entry point: 0x{entryPoint:X}");
-                Console.WriteLine("[+] Creating stealth thread...");
+        // ═══════════════════════════════════════════════════════
+        // METHOD 1: THREAD POOL APC (XENO/WAVE STYLE) ★★★★☆
+        // ═══════════════════════════════════════════════════════
+        static void InjectViaThreadPoolAPC(string dllPath)
+        {
+            Console.WriteLine("\n[GARCEA]: Boss, folosim Thread Pool APC ca la Xeno!");
+            Console.WriteLine("[GARCEA]: Cel mai sigur mod!\n");
 
-                IntPtr hThread = AntiByfronUltra.CreateStealthThread(processHandle, entryPoint, remoteBase);
+            // Random delay before starting (anti-pattern detection)
+            Thread.Sleep(new Random().Next(400, 1200));
 
-                if (hThread != IntPtr.Zero)
-                {
-                    Console.ForegroundColor = ConsoleColor.Green;
-                    Console.WriteLine("\n[✓✓✓] injectie successful!");
-                    Console.WriteLine("[✓✓✓] nedetektabil!");
-                    Console.WriteLine("[✓✓✓] ez v2!");
-                    Console.ResetColor();
-                    CloseHandle(hThread);
-                }
-                else
+            // Load DLL
+            byte[] dllBytes = File.ReadAllBytes(dllPath);
+            Console.WriteLine($"[+] DLL Size: {dllBytes.Length} bytes");
+
+            // Validate PE
+            if (!ValidatePE(dllBytes, out int peOffset, out int entryPointRVA, out int imageSize))
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("[-] Invalid PE file!");
+                Console.ResetColor();
+                return;
+            }
+
+            Console.WriteLine($"[+] Entry Point RVA: 0x{entryPointRVA:X}");
+            Console.WriteLine($"[+] Image Size: {imageSize} bytes");
+
+            // Step 1: Find thread pools
+            Console.WriteLine("\n[STEP 1/4] Scanning for thread pools...");
+            Thread.Sleep(new Random().Next(300, 800)); // small delay before scan
+
+            List<uint> poolThreads = AdvancedThreadPoolDetector.FindAdvancedThreadPools(
+                targetProcess,
+                alertableOnly: true,
+                robloxHeuristics: true,
+                verbose: true
+            );
+
+            if (poolThreads.Count == 0)
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("\n[!] No alertable pools found! Retrying relaxed...");
+                Console.ResetColor();
+                Thread.Sleep(600); // give it a moment
+                poolThreads = AdvancedThreadPoolDetector.FindAdvancedThreadPools(
+                    targetProcess,
+                    alertableOnly: false,
+                    robloxHeuristics: true,
+                    verbose: false
+                );
+
+                if (poolThreads.Count == 0)
                 {
                     Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine("[-] Thread creation failed");
+                    Console.WriteLine("[!] No thread pools found! Falling back to Burlan...");
                     Console.ResetColor();
+                    InjectViaBurlan(dllPath);
+                    return;
+                }
+            }
+
+            // Step 2: Select best thread
+            Console.WriteLine("\n[STEP 2/4] Selecting best thread...");
+            Thread.Sleep(new Random().Next(200, 700));
+
+            uint? bestThread = AdvancedThreadPoolDetector.SelectBestThread(poolThreads, targetProcess);
+            if (!bestThread.HasValue)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("[!] Failed to select thread!");
+                Console.ResetColor();
+                return;
+            }
+
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine($"[+] Selected thread: {bestThread.Value}");
+            Console.ResetColor();
+
+            // Step 3: Allocate and write DLL
+            Console.WriteLine("\n[STEP 3/4] Allocating memory and writing DLL...");
+            Thread.Sleep(new Random().Next(500, 1100));
+
+            IntPtr remoteBase = StealthAlloc((uint)imageSize);
+            if (remoteBase == IntPtr.Zero)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("[-] Memory allocation failed!");
+                Console.ResetColor();
+                return;
+            }
+
+            Console.WriteLine($"[+] Allocated at: 0x{remoteBase:X}");
+
+            if (!StealthWrite(remoteBase, dllBytes))
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("[-] Write failed!");
+                Console.ResetColor();
+                return;
+            }
+
+            Console.WriteLine("[+] DLL written successfully");
+
+            IntPtr entryPoint = remoteBase + entryPointRVA;
+            Console.WriteLine($"[+] Entry Point: 0x{entryPoint:X}");
+
+            // Step 4: Queue APC
+            Console.WriteLine("\n[STEP 4/4] Queuing APC to thread pool...");
+            Thread.Sleep(new Random().Next(400, 900));
+
+            IntPtr hThread = OpenThread(0x001F03FF, false, bestThread.Value);
+            if (hThread == IntPtr.Zero)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"[-] Failed to open thread! Error: {Marshal.GetLastWin32Error()}");
+                Console.ResetColor();
+                return;
+            }
+
+            int status = NtQueueApcThread(hThread, entryPoint, remoteBase, IntPtr.Zero, IntPtr.Zero);
+            CloseHandle(hThread);
+
+            if (status == 0)
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine("\n╔═══════════════════════════════════════════════════╗");
+                Console.WriteLine("║ ✅ INJECTION SUCCESSFUL! ✅ ║");
+                Console.WriteLine("╚═══════════════════════════════════════════════════╝");
+                Console.WriteLine();
+                Console.WriteLine($"[✓] Method: Thread Pool APC (Xeno/Wave style)");
+                Console.WriteLine($"[✓] Target Thread: {bestThread.Value}");
+                Console.WriteLine($"[✓] DLL Base: 0x{remoteBase:X}");
+                Console.WriteLine($"[✓] Entry Point: 0x{entryPoint:X}");
+                Console.WriteLine($"[✓] Detection Window: 5s - 5min");
+                Console.WriteLine($"[✓] Lifespan: Weeks - Months");
+                Console.WriteLine();
+                Console.WriteLine("[GARCEA]: BOSS, MERGE CA LA XENO!");
+                Console.WriteLine("[GARCEA]: Thread pool APC - undetectable!");
+                Console.WriteLine("[GARCEA]: Anticheatu nu ne vede!");
+                Console.ResetColor();
+
+                // ───────────────────────────────────────────────
+                // Xeno.dll auto-detection + lua kiddie menu
+                // ───────────────────────────────────────────────
+                if (Path.GetFileName(dllPath).Equals("Xeno.dll", StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.ForegroundColor = ConsoleColor.Magenta;
+                    Console.WriteLine("\n╔════════════════════════════════════╗");
+                    Console.WriteLine("║     XENO DETECTED – LUA TIME 💀    ║");
+                    Console.WriteLine("╚════════════════════════════════════╝");
+                    Console.ResetColor();
+
+                    Console.WriteLine("[+] Type lua scripts below (one per line)");
+                    Console.WriteLine("[+] Type 'exit' or 'back' to return\n");
+
+                    while (true)
+                    {
+                        Console.ForegroundColor = ConsoleColor.Cyan;
+                        Console.Write("lua> ");
+                        Console.ResetColor();
+
+                        string script = Console.ReadLine()?.Trim();
+                        if (string.IsNullOrEmpty(script)) continue;
+
+                        if (script.ToLower() == "exit" || script.ToLower() == "back" || script.ToLower() == "quit")
+                        {
+                            Console.WriteLine("[+] Closing Xeno lua console...");
+                            break;
+                        }
+
+                        // Forward to injected Xeno via pipe
+                        SendPipeCommand($"EXEC:{script}");
+
+                        Console.ForegroundColor = ConsoleColor.Green;
+                        Console.WriteLine($"[SENT] {script}");
+                        Console.ResetColor();
+                    }
                 }
             }
             else
             {
                 Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine("[-] Injection failed");
+                Console.WriteLine($"[-] NtQueueApcThread failed! NTSTATUS: 0x{status:X}");
+                Console.ResetColor();
+
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("\n[!] Falling back to thread hijacking...");
+                Console.ResetColor();
+
+                InjectViaBurlan(dllPath);
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // METHOD 2: BURLAN (THREAD HIJACKING) ★★★★☆
+        // ═══════════════════════════════════════════════════════
+
+        static void InjectViaBurlan(string dllPath)
+        {
+            Console.WriteLine("\n[GARCEA]: Boss, folosim Burlan (thread hijacking)!");
+            Console.WriteLine("[GARCEA]: Metoda clasica, merge sigur!\n");
+
+            bool success = RoabaBurlan.InjectBurlan(processHandle, targetProcess, dllPath);
+
+            if (success)
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine("\n[GARCEA]: ✓ Burlan injection successful boss!");
+                Console.ResetColor();
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("\n[GARCEA]: ✗ Burlan failed boss!");
                 Console.ResetColor();
             }
         }
+
+        // ═══════════════════════════════════════════════════════
+        // METHOD 3: SIMPLE (CREATEREMOTETHREAD) ★★☆☆☆
+        // ═══════════════════════════════════════════════════════
+
+        static void InjectSimple(string dllPath)
+        {
+            Console.WriteLine("\n[GARCEA]: Boss, folosim metoda simpla (CreateRemoteThread)");
+            Console.WriteLine("[GARCEA]: ATENTIE: Detectat rapid de anticheat!\n");
+
+            byte[] dllBytes = File.ReadAllBytes(dllPath);
+
+            if (!ValidatePE(dllBytes, out int peOffset, out int entryPointRVA, out int imageSize))
+            {
+                Console.WriteLine("[-] Invalid PE!");
+                return;
+            }
+
+            Console.WriteLine($"[+] Allocating {imageSize} bytes...");
+            IntPtr remoteBase = StealthAlloc((uint)imageSize);
+
+            if (remoteBase == IntPtr.Zero)
+            {
+                Console.WriteLine("[-] Allocation failed!");
+                return;
+            }
+
+            Console.WriteLine($"[+] Writing DLL to 0x{remoteBase:X}...");
+            if (!StealthWrite(remoteBase, dllBytes))
+            {
+                Console.WriteLine("[-] Write failed!");
+                return;
+            }
+
+            IntPtr entryPoint = remoteBase + entryPointRVA;
+            Console.WriteLine($"[+] Entry point: 0x{entryPoint:X}");
+
+            Console.WriteLine("[+] Creating remote thread...");
+            IntPtr hThread = CreateRemoteThread(
+                processHandle,
+                IntPtr.Zero,
+                0,
+                entryPoint,
+                remoteBase,
+                0,
+                out uint threadId
+            );
+
+            if (hThread != IntPtr.Zero)
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"\n[✓] Thread created! ID: {threadId}");
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("\n[WARNING] CreateRemoteThread is EASILY DETECTED!");
+                Console.WriteLine("[WARNING] Expected ban time: < 30 seconds");
+                Console.WriteLine("[WARNING] Use Thread Pool APC for stealth!");
+                Console.ResetColor();
+                CloseHandle(hThread);
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"[-] CreateRemoteThread failed!");
+                Console.WriteLine($"[-] Error: {Marshal.GetLastWin32Error()}");
+                Console.ResetColor();
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // METHOD 4: DEBUG MODE (VERBOSE OUTPUT)
+        // ═══════════════════════════════════════════════════════
+
+        static void InjectDebug(string dllPath)
+        {
+            Console.WriteLine("\n╔═══════════════════════════════════════════════════╗");
+            Console.WriteLine("║             DEBUG MODE - VERBOSE                  ║");
+            Console.WriteLine("╚═══════════════════════════════════════════════════╝\n");
+
+            byte[] dllBytes = File.ReadAllBytes(dllPath);
+            Console.WriteLine($"[DEBUG] DLL Size: {dllBytes.Length} bytes");
+
+            // Check MZ signature
+            if (dllBytes[0] != 0x4D || dllBytes[1] != 0x5A)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("[DEBUG] ✗ Not a valid PE file (missing MZ signature)");
+                Console.ResetColor();
+                return;
+            }
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine("[DEBUG] ✓ Valid MZ signature");
+            Console.ResetColor();
+
+            // Check PE offset
+            int peOffset = BitConverter.ToInt32(dllBytes, 0x3C);
+            Console.WriteLine($"[DEBUG] PE Offset: 0x{peOffset:X}");
+
+            if (peOffset < 0 || peOffset > dllBytes.Length - 4)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("[DEBUG] ✗ Invalid PE offset");
+                Console.ResetColor();
+                return;
+            }
+
+            // Check PE signature
+            if (dllBytes[peOffset] != 0x50 || dllBytes[peOffset + 1] != 0x45)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("[DEBUG] ✗ Invalid PE signature");
+                Console.ResetColor();
+                return;
+            }
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine("[DEBUG] ✓ Valid PE signature");
+            Console.ResetColor();
+
+            // Get headers
+            int entryPointRVA = BitConverter.ToInt32(dllBytes, peOffset + 0x28);
+            int imageSize = BitConverter.ToInt32(dllBytes, peOffset + 0x50);
+            short numberOfSections = BitConverter.ToInt16(dllBytes, peOffset + 0x06);
+
+            Console.WriteLine($"[DEBUG] Entry Point RVA: 0x{entryPointRVA:X}");
+            Console.WriteLine($"[DEBUG] Image Size: {imageSize} bytes");
+            Console.WriteLine($"[DEBUG] Number of Sections: {numberOfSections}");
+
+            // Allocate memory
+            Console.WriteLine("\n[DEBUG] Allocating memory...");
+            IntPtr remoteBase = StealthAlloc((uint)imageSize);
+
+            if (remoteBase == IntPtr.Zero)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"[DEBUG] ✗ Allocation failed!");
+                Console.WriteLine($"[DEBUG] Error code: {Marshal.GetLastWin32Error()}");
+                Console.ResetColor();
+                return;
+            }
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"[DEBUG] ✓ Allocated at: 0x{remoteBase:X}");
+            Console.ResetColor();
+
+            // Write DLL
+            Console.WriteLine("\n[DEBUG] Writing DLL to memory...");
+            if (!StealthWrite(remoteBase, dllBytes))
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("[DEBUG] ✗ Write failed!");
+                Console.ResetColor();
+                return;
+            }
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine("[DEBUG] ✓ DLL written successfully");
+            Console.ResetColor();
+
+            // Calculate entry point
+            IntPtr entryPoint = remoteBase + entryPointRVA;
+            Console.WriteLine($"\n[DEBUG] Entry Point Address: 0x{entryPoint:X}");
+
+            // Try multiple methods
+            Console.WriteLine("\n[DEBUG] Trying injection methods...\n");
+
+            // Method 1: NtCreateThreadEx
+            Console.WriteLine("[DEBUG] [1/3] Trying NtCreateThreadEx...");
+            IntPtr hThread = AntiByfronUltra.CreateStealthThread(processHandle, entryPoint, remoteBase);
+
+            if (hThread != IntPtr.Zero)
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[DEBUG] ✓ NtCreateThreadEx worked! Handle: 0x{hThread:X}");
+                Console.ResetColor();
+                CloseHandle(hThread);
+                return;
+            }
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"[DEBUG] ✗ NtCreateThreadEx failed (error: {Marshal.GetLastWin32Error()})");
+            Console.ResetColor();
+
+            // Method 2: CreateRemoteThread
+            Console.WriteLine("\n[DEBUG] [2/3] Trying CreateRemoteThread...");
+            hThread = CreateRemoteThread(
+                processHandle,
+                IntPtr.Zero,
+                0,
+                entryPoint,
+                remoteBase,
+                0,
+                out uint threadId
+            );
+
+            if (hThread != IntPtr.Zero)
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[DEBUG] ✓ CreateRemoteThread worked! Thread ID: {threadId}");
+                Console.ResetColor();
+                CloseHandle(hThread);
+                return;
+            }
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"[DEBUG] ✗ CreateRemoteThread failed (error: {Marshal.GetLastWin32Error()})");
+            Console.ResetColor();
+
+            // Method 3: Thread Pool APC
+            Console.WriteLine("\n[DEBUG] [3/3] Trying Thread Pool APC...");
+            List<uint> pools = AdvancedThreadPoolDetector.FindAdvancedThreadPools(
+                targetProcess,
+                alertableOnly: false,
+                robloxHeuristics: false,
+                verbose: true
+            );
+
+            if (pools.Count > 0)
+            {
+                uint tid = pools[0];
+                Console.WriteLine($"[DEBUG] Using thread: {tid}");
+
+                IntPtr hPoolThread = OpenThread(0x001F03FF, false, tid);
+                if (hPoolThread != IntPtr.Zero)
+                {
+                    int status = NtQueueApcThread(hPoolThread, entryPoint, remoteBase, IntPtr.Zero, IntPtr.Zero);
+                    CloseHandle(hPoolThread);
+
+                    if (status == 0)
+                    {
+                        Console.ForegroundColor = ConsoleColor.Green;
+                        Console.WriteLine("[DEBUG] ✓ Thread Pool APC worked!");
+                        Console.ResetColor();
+                        return;
+                    }
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine($"[DEBUG] ✗ NtQueueApcThread failed (NTSTATUS: 0x{status:X})");
+                    Console.ResetColor();
+                }
+            }
+
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine("\n[DEBUG] ✗✗✗ ALL METHODS FAILED!");
+            Console.WriteLine("[DEBUG] Possible causes:");
+            Console.WriteLine("  - Process has strong protections");
+            Console.WriteLine("  - DLL is incompatible");
+            Console.WriteLine("  - Insufficient privileges");
+            Console.WriteLine("  - Anti-cheat is blocking");
+            Console.ResetColor();
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // HELPER: VALIDATE PE
+        // ═══════════════════════════════════════════════════════
+
+        static bool ValidatePE(byte[] dllBytes, out int peOffset, out int entryPointRVA, out int imageSize)
+        {
+            peOffset = 0;
+            entryPointRVA = 0;
+            imageSize = 0;
+
+            if (dllBytes.Length < 64)
+                return false;
+
+            // Check MZ
+            if (dllBytes[0] != 0x4D || dllBytes[1] != 0x5A)
+                return false;
+
+            // Get PE offset
+            peOffset = BitConverter.ToInt32(dllBytes, 0x3C);
+            if (peOffset < 0 || peOffset > dllBytes.Length - 0x50)
+                return false;
+
+            // Check PE
+            if (dllBytes[peOffset] != 0x50 || dllBytes[peOffset + 1] != 0x45)
+                return false;
+
+            // Get entry point and image size
+            entryPointRVA = BitConverter.ToInt32(dllBytes, peOffset + 0x28);
+            imageSize = BitConverter.ToInt32(dllBytes, peOffset + 0x50);
+
+            return true;
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // P/INVOKE
+        // ═══════════════════════════════════════════════════════
+
+        [DllImport("kernel32.dll")]
+        static extern IntPtr CreateRemoteThread(
+            IntPtr hProcess,
+            IntPtr lpThreadAttributes,
+            uint dwStackSize,
+            IntPtr lpStartAddress,
+            IntPtr lpParameter,
+            uint dwCreationFlags,
+            out uint lpThreadId
+        );
+
+        [DllImport("ntdll.dll")]
+        static extern int NtQueueApcThread(
+            IntPtr ThreadHandle,
+            IntPtr ApcRoutine,
+            IntPtr ApcArgument1,
+            IntPtr ApcArgument2,
+            IntPtr ApcArgument3
+        );
+
+        [DllImport("kernel32.dll")]
+        static extern IntPtr OpenThread(uint dwDesiredAccess, bool bInheritHandle, uint dwThreadId);
 
         static void AdvancedMode()
         {
