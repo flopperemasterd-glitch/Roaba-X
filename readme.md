@@ -38,7 +38,7 @@ Select a process, then choose from:
 - garantat tigan proof ❌
 
 ## Disclaimer
-For educational purposes only. But you may use Roaba X however you like as it is not that powerful and not configured to bypass anticheat ( yet :) )
+For educational purposes only. This tool or its creators are not responsible for any ban enforcement action taken on your account. this tool is purely for pentesting anticheats (with Romania vibes)... ofc it can be used for exploits but i dont advice you to do so.
 
 ## License
 MIT or whatever, just don't let the gypsies steal the roaba 🛞
