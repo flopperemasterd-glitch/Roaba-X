@@ -142,7 +142,7 @@ namespace Roaba_Matii
             List<uint> poolThreads = new List<uint>();
 
             Console.WriteLine("\n╔═══════════════════════════════════════════════════╗");
-            Console.WriteLine("║   🔍 ADVANCED THREAD POOL DETECTION 🔍          ║");
+            Console.WriteLine("║    ADVANCED THREAD POOL DETECTION           ║");
             Console.WriteLine("╚═══════════════════════════════════════════════════╝\n");
 
             if (verbose)
@@ -1014,7 +1014,7 @@ namespace Roaba_Matii
             string newName = legitimateNames[rng.Next(legitimateNames.Length)];
 
             Console.ForegroundColor = ConsoleColor.Cyan;
-            Console.WriteLine($"[STEALTH] Disguised as: {newName}");
+            Console.WriteLine($"[STEALTH] Disguised as: {newName}"); //placeholder, TODO: add actual spoofing if possible with no kernel drivers
             Console.ResetColor();
         }
 
@@ -1200,7 +1200,7 @@ namespace Roaba_Matii
 
         public static IntPtr InjectViaSection(IntPtr hProcess, byte[] dllBytes)
         {
-            Console.WriteLine("[XENO] Starting section-based injection...");
+            Console.WriteLine("[+] Starting section-based injection...");
 
             try
             {
